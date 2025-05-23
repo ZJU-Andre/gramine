@@ -1,0 +1,154 @@
+loader.entrypoint = "file:{{ gramine.libos }}"
+libos.entrypoint = "/shared_enclave_server" # Path to the server executable inside Gramine
+
+loader.log_level = "debug" # Set to "error" or "warn" for production
+
+# Filesystem mounts
+# These define how the enclave sees the outside world's filesystem.
+fs.mounts = [
+  { path = "/lib", uri = "file:{{ gramine.runtimedir() }}/lib" }, # Standard Gramine libraries
+  { path = "/usr/lib", uri = "file:/usr/lib" }, # For system libraries like libssl, libcrypto. Path may vary.
+                                               # Check your system or container for actual locations.
+  { path = "/etc", uri = "file:/etc" }, # For /etc/nsswitch.conf, /etc/host.conf, /etc/resolv.conf if network needed by app directly
+  { path = "/shared_enclave_server", uri = "file:shared_enclave_server" }, # The server executable itself
+  { path = "/dev", uri = "file:/dev" }, # To allow /dev/null, /dev/random, /dev/urandom etc.
+  # Certificates for OpenSSL, if not baked into the application or provided differently.
+  # This example assumes they are in /etc/ssl/certs. Adjust if your system is different.
+  { path = "/etc/ssl/certs", uri = "file:/etc/ssl/certs" },
+  # Mount server.crt and server.key if they are read from the filesystem at runtime
+  # and not embedded or configured via absolute paths elsewhere.
+  # If main.cpp uses relative paths like "server.crt", they need to be relative to CWD
+  # or an absolute path within Gramine's FS needs to be used.
+  # For simplicity, if "server.crt" and "server.key" are in the same directory as
+  # the executable and invoked from there, this mount might not be strictly needed
+  # if the current working directory is the root of the manifest-defined FS.
+  # However, it's safer to be explicit if they are expected at root:
+  { path = "/server.crt", uri = "file:server.crt" },
+  { path = "/server.key", uri = "file:server.key" },
+]
+
+# SGX Specific Settings
+sgx.debug = true      # Enable SGX debugging features (e.g., allows attaching GDB). Set to false for production.
+sgx.enclave_size = "1G" # Initial enclave memory size. Can be "128M", "2G", etc. Adjust based on application needs.
+sgx.max_threads = 32  # Maximum number of threads the enclave can run.
+                      # Consider client handler threads, server's main/acceptor threads, and any SGX internal threads.
+
+# Remote Attestation Configuration for DCAP (Datacenter Attestation Primitives)
+sgx.remote_attestation = "dcap"
+
+# Allowed Files/Resources by the Enclave
+# This is a critical security setting. Only list resources the enclave absolutely needs.
+sgx.allowed_files = [
+  # Standard SGX device, necessary for enclave operation.
+  "file:/dev/sgx_enclave",
+
+  # DCAP provisioning files/devices. These are needed for the QUOTE generation process
+  # to communicate with the AESM (Architectural Enclave Service Manager) or its equivalent.
+  "file:/dev/sgx_provision",
+  # The following /dev/attestation paths are specific to Gramine's DCAP integration.
+  # They are pseudo-files used by the application to interact with the attestation process.
+  "file:/dev/attestation/user_report_data", # For providing custom data to be included in the quote's report_data field.
+  "file:/dev/attestation/quote",            # For retrieving the generated SGX quote.
+  "file:/dev/attestation/report",           # Might be used for local attestation or if directly verifying reports.
+                                            # For remote attestation, 'quote' is primary.
+
+  # Network access: Allow TCP listening on the specified port.
+  # Ensure this matches the port used in main.cpp (default is 12345).
+  "tcp://0.0.0.0:12345",
+
+  # For OpenSSL to find CA certificates, if server needs to validate client certs or make outbound TLS calls.
+  # Often OpenSSL will look in /etc/ssl/certs/ca-certificates.crt or similar.
+  # This depends on the OS/distro the files are from.
+  "file:/etc/ssl/certs/ca-certificates.crt", # Example path, verify for your system.
+  "file:/server.crt", # Allow reading server's own certificate
+  "file:/server.key", # Allow reading server's own private key
+]
+
+# Trusted Files
+# These files are measured and their hash contributes to MRENCLAVE.
+# Any change to these files will change MRENCLAVE, impacting attestation.
+# List all executable code (application, shared libraries) and critical read-only data.
+# Identifying all of these accurately is crucial for security and reproducible attestation.
+# Use `gramine-sgx-pf-checker` or debug logs from Gramine to find all accessed files.
+sgx.trusted_files = [
+  # Gramine's LibOS and runtime components
+  "file:{{ gramine.libos }}",
+  "file:{{ gramine.runtimedir() }}/lib/ld-linux-x86-64.so.2", # Dynamic linker/loader
+  "file:{{ gramine.runtimedir() }}/lib/libsysdb.so",           # Gramine system database library
+  "file:{{ gramine.runtimedir() }}/lib/libutil.so",            # Gramine utility library (example, may not be direct dependency)
+
+  # The server executable itself
+  "file:/shared_enclave_server",
+
+  # Core C libraries (paths depend on the toolchain/environment where these libs are sourced)
+  # These are examples, actual filenames and paths might differ (e.g., libc.so.6, libm.so.6).
+  # Check {{ gramine.runtimedir() }}/lib for Gramine-provided versions first.
+  "file:{{ gramine.runtimedir() }}/lib/libc.so",    # C standard library
+  "file:{{ gramine.runtimedir() }}/lib/libm.so",     # Math library
+  "file:{{ gramine.runtimedir() }}/lib/libpthread.so", # POSIX threads library
+  "file:{{ gramine.runtimedir() }}/lib/libdl.so",    # Dynamic linking library
+
+  # OpenSSL libraries (critical for TLS and crypto operations)
+  # Ensure these paths match where libssl.so and libcrypto.so are located
+  # within the Gramine FS (as per fs.mounts).
+  # Example for /usr/lib mount:
+  "file:/usr/lib/x86_64-linux-gnu/libssl.so.3",    # Adjust version number as needed
+  "file:/usr/lib/x86_64-linux-gnu/libcrypto.so.3", # Adjust version number as needed
+
+  # Other libraries that might be pulled in by OpenSSL or C++ stdlib
+  "file:{{ gramine.runtimedir() }}/lib/libz.so.1", # zlib, often a dependency of OpenSSL or other libs
+  "file:{{ gramine.runtimedir() }}/lib/libgcc_s.so.1", # GCC runtime library
+  "file:{{ gramine.runtimedir() }}/lib/libstdc++.so.6", # C++ standard library
+
+  # NSS (Name Service Switch) libraries if doing hostname resolution or other NSS functions
+  # These are often found in {{ gramine.runtimedir() }}/lib/
+  "file:{{ gramine.runtimedir() }}/lib/libnss_dns.so",
+  "file:{{ gramine.runtimedir() }}/lib/libnss_files.so",
+  "file:{{ gramine.runtimedir() }}/lib/libresolv.so",
+
+  # Configuration files that need to be trusted (if any)
+  # "file:/etc/nsswitch.conf", # Example if networking relies on it and it's critical
+  # "file:/etc/ssl/openssl.cnf", # If a specific OpenSSL config is used and trusted
+
+  # Server certificate and key if their content integrity is part of the enclave measurement.
+  # This means if the cert/key changes, MRENCLAVE changes.
+  # Often, these are *not* in trusted_files if you want to update them without rebuilding the enclave.
+  # If they are in allowed_files (readable by enclave) but not trusted_files, their content
+  # is not part of MRENCLAVE. The hash of the certificate is included in the quote's report_data,
+  # binding the specific certificate to that quote.
+  # "file:/server.crt",
+  # "file:/server.key",
+]
+
+# Environment variables for the application running inside Gramine.
+# These are passed to the application inside the enclave.
+# loader.env.LD_LIBRARY_PATH = "/lib:/usr/lib" # Example, Gramine usually handles this.
+#
+# For DCAP, environment variables might be needed to configure PCCS (Provisioning Certificate Caching Service)
+# or other aspects of the DCAP client library, especially if not using default Azure DCAP client behavior.
+# Consult Gramine and Intel SGX DCAP documentation for specifics. Examples:
+# loader.env.PCCS_URL = "https://your-pccs-server:port" # URL of your PCCS server
+# loader.env.SGX_AESM_ADDR = "1" # Use AESM for quoting (if not using in-process quoting)
+# loader.env.AZURE_DCAP_API_VERSION = "2021-07-01" # If using Azure DCAP client and need specific API version
+# loader.env.HTTPS_PROXY = "http://your-proxy-server:port" # If PCCS access requires a proxy
+
+# Ensure that all paths in sgx.trusted_files and sgx.allowed_files are consistent
+# with the fs.mounts definitions. For example, if libssl is at /usr/lib/libssl.so.3 on the host
+# and you mount { path = "/usr/lib", uri = "file:/usr/lib" }, then in trusted_files you'd use
+# "file:/usr/lib/libssl.so.3".
+# If you copied it into Gramine's runtime dir, it might be "file:{{ gramine.runtimedir() }}/lib/libssl.so.3".
+
+# Final check: The list of trusted files is extensive.
+# For a production system, this list must be carefully audited and minimized.
+# Using `strace` or Gramine's debug logs (`loader.log_level = "debug"`) on a non-SGX run
+# (`gramine-direct`) and then on an SGX run (`gramine-sgx`) can help identify accessed files.
+# The tool `gramine-sgx-pf-checker` is also invaluable for checking Process Forest rules.
+# For this template, a comprehensive but potentially more-than-minimal set is provided for common libraries.
+# Some libraries listed in trusted_files (e.g. libfontconfig, libexpat from original prompt) were removed
+# as they are not standard dependencies for a C++ server unless GUI/font features are used.
+# Added common ones like libz, libgcc_s, libstdc++, NSS libs.
+# The exact set of system libraries (libc, libpthread, libssl, libcrypto, etc.) and their paths
+# are highly dependent on the build environment (e.g., specific Linux distribution, versions).
+# The paths like "/usr/lib/x86_64-linux-gnu/" are common on Debian/Ubuntu. Others use "/usr/lib64/".
+# {{ gramine.runtimedir() }}/lib should be preferred for Gramine-provided libs.
+```

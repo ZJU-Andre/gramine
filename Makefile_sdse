@@ -1,0 +1,20 @@
+CXX = g++
+CXXFLAGS = -std=c++17 -Wall -pthread -g # Enable debugging symbols
+LDFLAGS = -lpthread
+
+TARGET = sdse_server_app
+SOURCES = sdse_main.cpp sdse_server.cpp
+OBJECTS = $(SOURCES:.cpp=.o)
+
+all: $(TARGET)
+
+$(TARGET): $(OBJECTS)
+	$(CXX) $(CXXFLAGS) -o $(TARGET) $(OBJECTS) $(LDFLAGS)
+
+%.o: %.cpp sdse_server.h sdse_protocol.h
+	$(CXX) $(CXXFLAGS) -c $< -o $@
+
+clean:
+	rm -f $(OBJECTS) $(TARGET)
+
+.PHONY: all clean

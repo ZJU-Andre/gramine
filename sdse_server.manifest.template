@@ -1,0 +1,64 @@
+loader.entrypoint = "file:{{ gramine.libos }}"
+libos.entrypoint = "/sdse_server_app" # Path to the SDSE executable (matches Makefile target)
+loader.argv = [
+  "/sdse_server_app",            # argv[0] is the program name
+  "/tmp/sdse.sock"               # argv[1] is the UDS socket path
+]
+loader.log_level = "debug" # Set to "error" or "warn" for production
+
+# Filesystem mounts
+# These define how the enclave sees the outside world's filesystem.
+fs.mounts = [
+  { path = "/lib", uri = "file:{{ gramine.runtimedir() }}/lib" },
+  # Mount /usr/lib if system libraries (e.g. libstdc++, libgcc_s) not provided by Gramine are needed.
+  # Check with gramine-sgx-pf-checker or ldd on the non-SGX version of the binary.
+  { path = "/usr/lib", uri = "file:/usr/lib" }, 
+  { path = "/sdse_server_app", uri = "file:sdse_server_app" }, # The server executable
+  # Mount for the UDS socket. The directory must be writable by the enclave if creating the socket file.
+  # Using /tmp is common. Ensure host /tmp is accessible and appropriate.
+  { path = "/tmp", uri = "file:/tmp" } 
+]
+
+# SGX Specific Settings
+sgx.debug = true      # Enable SGX debugging features. Set to false for production.
+sgx.enclave_size = "512M" # Initial enclave memory size. Adjust based on data store needs.
+sgx.max_threads = 16      # For listener and multiple client handler threads. Adjust as needed.
+
+# Allowed files - crucial for UDS communication.
+# The enclave needs to be able to create, bind, listen, read, write, and unlink the UDS socket file.
+sgx.allowed_files = [
+  # If using a filesystem-based UDS (e.g., /tmp/sdse.sock):
+  "file:/tmp/sdse.sock",
+  # If using an abstract namespace UDS (starts with a null byte, represented as unix://[abstract=...]):
+  # "unix://[abstract=/tmp/sdse.sock]", # Note: Path after 'abstract=' is just an ID, doesn't create fs file.
+                                        # Client must use the exact same abstract name.
+  # For this example, we'll primarily focus on the filesystem UDS as it's explicit in argv.
+  
+  # Minimal devices needed. /dev/sgx_enclave is only needed if the server itself performs
+  # SGX operations like sealing data or attestation (not part of this SDSE server's core IPC role).
+  # "file:/dev/sgx_enclave", 
+]
+
+# Trusted files
+# These files are measured and their hash contributes to MRENCLAVE.
+# List all executable code (application, shared libraries) and critical read-only data.
+# Use `gramine-sgx-pf-checker` or debug logs from Gramine to find all accessed files.
+sgx.trusted_files = [
+  "file:{{ gramine.libos }}",
+  "file:{{ gramine.runtimedir() }}/lib/ld-linux-x86-64.so.2", # Dynamic linker
+  "file:{{ gramine.runtimedir() }}/lib/libsysdb.so",           # Gramine system database
+  "file:/sdse_server_app",                                    # The server executable itself
+
+  # Common C/C++ libraries. Paths and versions might vary based on your build environment.
+  # It's best to use `gramine-sgx-pf-checker` or analyze `strace` logs to get the exact list.
+  # The following are common examples and might be provided by Gramine's runtimedir:
+  "file:{{ gramine.runtimedir() }}/lib/libc.so.6",
+  "file:{{ gramine.runtimedir() }}/lib/libpthread.so.0",
+  "file:{{ gramine.runtimedir() }}/lib/libstdc++.so.6", # If using C++ standard library features
+  "file:{{ gramine.runtimedir() }}/lib/libgcc_s.so.1",  # GCC runtime library
+  # Add other dependent .so files as needed.
+]
+
+# Environment variables (if any needed by the server application)
+# loader.env.MY_VARIABLE = "value"
+```

@@ -1,0 +1,66 @@
+loader.entrypoint = "file:{{ gramine.libos }}"
+libos.entrypoint = "/sdse_client_app" # Path to the client executable (matches Makefile target)
+loader.argv = [
+  "/sdse_client_app",            # argv[0] is the program name
+  "/tmp/sdse.sock"               # argv[1] is the UDS socket path to connect to
+]
+loader.log_level = "debug" # Set to "error" or "warn" for production
+
+# Filesystem mounts
+fs.mounts = [
+  { path = "/lib", uri = "file:{{ gramine.runtimedir() }}/lib" },
+  { path = "/usr/lib", uri = "file:/usr/lib" }, # For system libs if any
+  { path = "/sdse_client_app", uri = "file:sdse_client_app" }, # The client executable
+  # Mount for the UDS socket path. Client needs to access this path to connect.
+  { path = "/tmp", uri = "file:/tmp" } 
+]
+
+# SGX Specific Settings
+sgx.debug = true
+sgx.enclave_size = "128M" # Generally smaller for a client application
+sgx.max_threads = 4       # Client might be simpler, adjust if needed
+
+# Allowed files - crucial for UDS client communication.
+# Client needs to connect to the UDS socket created by the server.
+sgx.allowed_files = [
+  # If using a filesystem-based UDS (e.g., /tmp/sdse.sock):
+  "file:/tmp/sdse.sock", 
+  # If using an abstract namespace UDS (starts with a null byte, represented as unix://[abstract=...]):
+  # "unix://[abstract=/tmp/sdse.sock]", # Client would need to use the same abstract name.
+  # The manifest should reflect the type of UDS being used. This example focuses on filesystem UDS.
+
+  # `/dev/sgx_enclave` might be needed if the client generates its MRENCLAVE (e.g. via sgx_create_report)
+  # for registration with the SDSE server, assuming registration involves client identity verification.
+  # For this subtask, assuming client_id is an arbitrary hash provided by the client,
+  # but in a real system, this would be derived from MRENCLAVE.
+  # "file:/dev/sgx_enclave", 
+]
+
+# Trusted files
+# These files are measured and their hash contributes to MRENCLAVE.
+# List all executable code (application, shared libraries) and critical read-only data.
+# Use `gramine-sgx-pf-checker` or debug logs from Gramine to find all accessed files.
+sgx.trusted_files = [
+  "file:{{ gramine.libos }}",
+  "file:{{ gramine.runtimedir() }}/lib/ld-linux-x86-64.so.2", # Dynamic linker
+  "file:{{ gramine.runtimedir() }}/lib/libsysdb.so",           # Gramine system database
+  "file:/sdse_client_app",                                    # The client executable itself
+
+  # Common C/C++ libraries. Similar to the server, these need to be accurate.
+  "file:{{ gramine.runtimedir() }}/lib/libc.so.6",
+  "file:{{ gramine.runtimedir() }}/lib/libpthread.so.0",
+  "file:{{ gramine.runtimedir() }}/lib/libstdc++.so.6",
+  "file:{{ gramine.runtimedir() }}/lib/libgcc_s.so.1",
+  # Add other dependent .so files as needed.
+]
+
+# Environment variables (if any needed by the client application)
+# loader.env.CLIENT_SPECIFIC_VAR = "client_value"
+
+# Note on UDS paths: 
+# If the server uses an abstract namespace socket, the client's `sgx.allowed_files` must use the 
+# `unix://[abstract=...]` syntax with the matching abstract name. 
+# If the server uses a filesystem socket (like `/tmp/sdse.sock` as configured in `loader.argv`), 
+# then `file:/tmp/sdse.sock` is correct for `sgx.allowed_files`.
+# The `fs.mounts` entry for `/tmp` ensures the path is accessible.
+```

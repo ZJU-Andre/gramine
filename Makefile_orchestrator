@@ -1,0 +1,22 @@
+CXX = g++
+# Add -I/usr/local/cuda/include (or your CUDA include path) if cuda.h is not found by default
+CXXFLAGS = -std=c++11 -Wall -pthread -I/usr/local/cuda/include
+# Add -L/usr/local/cuda/lib64 (or your CUDA lib path) if libcuda is not found by default
+LDFLAGS = -lssl -lcrypto -lpthread -ldl -L/usr/local/cuda/lib64 -lcuda
+
+TARGET = gpu-orchestrator
+SOURCES = main_orchestrator.cpp orchestrator.cpp
+OBJECTS = $(SOURCES:.cpp=.o)
+
+all: $(TARGET)
+
+$(TARGET): $(OBJECTS)
+	$(CXX) $(CXXFLAGS) -o $(TARGET) $(OBJECTS) $(LDFLAGS)
+
+%.o: %.cpp orchestrator.h protocol.h
+	$(CXX) $(CXXFLAGS) -c $< -o $@
+
+clean:
+	rm -f $(OBJECTS) $(TARGET)
+
+.PHONY: all clean
