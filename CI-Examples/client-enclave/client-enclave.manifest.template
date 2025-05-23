@@ -1,0 +1,21 @@
+loader.log_level = "error"
+
+libos.entrypoint = "/bin/client_app"
+
+sys.stack.size = "2M"
+
+sgx.enclave_size = "1G"
+sgx.max_threads = 4
+sgx.allowed_files = [
+  "dev:/dev/nvidia0",
+  "dev:/dev/nvidiactl",
+  "dev:/dev/nvidia-uvm",
+]
+
+fs.mounts = [
+  { path = "/untrusted_region", type = "untrusted_shm", uri = "file:/gramine/untrusted_shm/shared_region" },
+]
+
+sgx.trusted_files = [
+  "file:/bin/client_app",
+]
