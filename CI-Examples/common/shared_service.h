@@ -76,6 +76,12 @@ typedef struct {
     unsigned char tag_c[GCM_TAG_SIZE_BYTES];
     unsigned char data_c[VECTOR_ARRAY_MAX_ELEMENTS * sizeof(float)]; // Name changed from masked_data_c
 
+    // DMA related fields: if masking_level is MASKING_NONE and these are non-zero,
+    // the service will use these as source device pointers for DMA from client's
+    // host-allocated pinned memory.
+    uint64_t src_device_ptr_b; 
+    uint64_t src_device_ptr_c;
+
 } vector_add_request_payload_t;
 
 typedef struct {
@@ -117,6 +123,11 @@ typedef struct {
     // Input tensor data. Content is plaintext if masking_level is MASKING_NONE.
     unsigned char input_tensor[MAX_ONNX_INPUT_SIZE_BYTES]; // Name changed from masked_input_tensor
 
+    // DMA related field: if masking_level is MASKING_NONE and this is non-zero,
+    // the service will use this as source device pointer for DMA from client's
+    // host-allocated pinned memory.
+    uint64_t src_device_ptr_input_tensor;
+
 } onnx_inference_request_payload_t;
 
 typedef struct {
@@ -155,14 +166,24 @@ typedef struct {
     uint32_t matrix_a_size_bytes; // M*K*sizeof(float)
     unsigned char iv_a[GCM_IV_SIZE_BYTES];
     unsigned char tag_a[GCM_TAG_SIZE_BYTES];
-    // Actual data size sent will be matrix_a_size_bytes
-    unsigned char masked_matrix_a[MAX_GEMM_MATRIX_SIZE_BYTES]; 
+    // Actual data size sent will be matrix_a_size_bytes.
+    // Content is AES-GCM ciphertext if masking_level is MASKING_AES_GCM,
+    // otherwise plaintext (if not using DMA path).
+    unsigned char matrix_a[MAX_GEMM_MATRIX_SIZE_BYTES]; 
 
     uint32_t matrix_b_size_bytes; // K*N*sizeof(float)
     unsigned char iv_b[GCM_IV_SIZE_BYTES];
     unsigned char tag_b[GCM_TAG_SIZE_BYTES];
-    // Actual data size sent will be matrix_b_size_bytes
-    unsigned char masked_matrix_b[MAX_GEMM_MATRIX_SIZE_BYTES];
+    // Actual data size sent will be matrix_b_size_bytes.
+    // Content is AES-GCM ciphertext if masking_level is MASKING_AES_GCM,
+    // otherwise plaintext (if not using DMA path).
+    unsigned char matrix_b[MAX_GEMM_MATRIX_SIZE_BYTES];
+
+    // DMA related fields: if masking_level is MASKING_NONE and these are non-zero,
+    // the service will use these as source device pointers for DMA from client's
+    // host-allocated pinned memory.
+    uint64_t src_device_ptr_matrix_a;
+    uint64_t src_device_ptr_matrix_b;
     
 } gemm_request_payload_t;
 

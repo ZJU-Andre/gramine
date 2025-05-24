@@ -4,6 +4,7 @@
 #include <time.h>    
 #include <assert.h>
 #include <math.h>    
+#include <cuda_runtime.h> // For CUDA host memory allocation
 
 // Gramine includes
 #include "libos_ipc.h"
@@ -11,6 +12,19 @@
 
 // Shared header with service
 #include "shared_service.h" // From CI-Examples/common/
+
+// CUDA error checking macro
+#define CUDA_CHECK(call) \
+    do { \
+        cudaError_t err = call; \
+        if (err != cudaSuccess) { \
+            fprintf(stderr, "CUDA_ERROR at %s:%d - %s\n", __FILE__, __LINE__, cudaGetErrorString(err)); \
+            /* This exit is simplistic. In a real app, ensure proper resource cleanup. */ \
+            /* For this client, the goto cleanup_exit structure handles freeing some resources. */ \
+            /* However, if CUDA_CHECK fails during alloc, h_A/h_B might not be set for cleanup. */ \
+            exit(EXIT_FAILURE); \
+        } \
+    } while (0)
 
 // Define matrix dimensions for this example
 // M, N, K should be <= MAX_GEMM_DIM_SIZE (512)
@@ -106,13 +120,46 @@ int main(int argc, char *argv[]) {
         return EXIT_FAILURE;
     }
 
-    float* h_A = (float*)malloc(M * K * sizeof(float));
-    float* h_B = (float*)malloc(K * N * sizeof(float));
-    float* h_C_expected = (float*)malloc(M * N * sizeof(float));
-    float* h_C_result_decrypted = (float*)malloc(M * N * sizeof(float));
+    size_t size_A_bytes = M * K * sizeof(float);
+    size_t size_B_bytes = K * N * sizeof(float);
+    size_t size_C_bytes = M * N * sizeof(float);
+
+    float* h_A = NULL;
+    float* h_B = NULL;
+    uint64_t d_ptr_A = 0;
+    uint64_t d_ptr_B = 0;
+
+    // h_C_expected and h_C_result_decrypted are always host-side for verification
+    float* h_C_expected = (float*)malloc(size_C_bytes);
+    float* h_C_result_decrypted = (float*)malloc(size_C_bytes);
+
+    if (current_masking_level == MASKING_NONE) {
+        printf("CLIENT_APP_GEMM_LOG: Allocating page-locked (pinned) host memory for A and B using cudaHostAlloc...\n");
+        CUDA_CHECK(cudaHostAlloc((void**)&h_A, size_A_bytes, cudaHostAllocDefault));
+        CUDA_CHECK(cudaHostAlloc((void**)&h_B, size_B_bytes, cudaHostAllocDefault));
+
+        printf("CLIENT_APP_GEMM_LOG: Getting device pointers for h_A and h_B...\n");
+        CUDA_CHECK(cudaHostGetDevicePointer((void**)&d_ptr_A, (void*)h_A, 0));
+        CUDA_CHECK(cudaHostGetDevicePointer((void**)&d_ptr_B, (void*)h_B, 0));
+        printf("CLIENT_APP_GEMM_LOG: Device pointer for h_A: 0x%lx, for h_B: 0x%lx\n", d_ptr_A, d_ptr_B);
+    } else { // MASKING_AES_GCM
+        h_A = (float*)malloc(size_A_bytes);
+        h_B = (float*)malloc(size_B_bytes);
+    }
 
     if (!h_A || !h_B || !h_C_expected || !h_C_result_decrypted) {
         fprintf(stderr, "CLIENT_APP_GEMM_ERROR: Failed to allocate memory for host matrices.\n");
+        // Free any potentially allocated memory before exit
+        if (h_C_expected) free(h_C_expected);
+        if (h_C_result_decrypted) free(h_C_result_decrypted);
+        if (h_A) { // Check if h_A was allocated (could be cudaHostAlloc or malloc)
+            if (current_masking_level == MASKING_NONE && d_ptr_A != 0) cudaFreeHost(h_A); // d_ptr_A implies cudaHostAlloc was successful
+            else if (current_masking_level == MASKING_AES_GCM) free(h_A);
+        }
+        if (h_B) { // Check if h_B was allocated
+            if (current_masking_level == MASKING_NONE && d_ptr_B != 0) cudaFreeHost(h_B); // d_ptr_B implies cudaHostAlloc was successful
+            else if (current_masking_level == MASKING_AES_GCM) free(h_B);
+        }
         return EXIT_FAILURE;
     }
 
@@ -138,6 +185,8 @@ int main(int argc, char *argv[]) {
 
     if (current_masking_level == MASKING_AES_GCM) {
         printf("CLIENT_APP_GEMM_LOG: Encrypting input matrices A and B using AES-GCM...\n");
+        request_payload.src_device_ptr_matrix_a = 0; // Not using DMA
+        request_payload.src_device_ptr_matrix_b = 0; // Not using DMA
         generate_iv(request_payload.iv_a, GCM_IV_SIZE_BYTES);
         ret = libos_aes_gcm_encrypt(aes_key, request_payload.iv_a, (const unsigned char*)h_A, 
                                         request_payload.matrix_a_size_bytes,
@@ -151,8 +200,13 @@ int main(int argc, char *argv[]) {
         if (ret != 0) { fprintf(stderr, "CLIENT_APP_GEMM_ERROR: Encryption of matrix B failed: %d\n", ret); goto cleanup_exit; }
     } else { // MASKING_NONE
         printf("CLIENT_APP_GEMM_LOG: Preparing input matrices A and B as plaintext...\n");
-        memcpy(request_payload.matrix_a, h_A, request_payload.matrix_a_size_bytes);
-        memcpy(request_payload.matrix_b, h_B, request_payload.matrix_b_size_bytes);
+        memcpy(request_payload.matrix_a, h_A, request_payload.matrix_a_size_bytes); // Data copied for non-DMA path
+        memcpy(request_payload.matrix_b, h_B, request_payload.matrix_b_size_bytes); // Data copied for non-DMA path
+        // For DMA path, src_device_ptr fields are set.
+        request_payload.src_device_ptr_matrix_a = d_ptr_A;
+        request_payload.src_device_ptr_matrix_b = d_ptr_B;
+        printf("CLIENT_APP_GEMM_LOG: Using DMA path. Device pointers set in request.\n");
+        // matrix_a and matrix_b fields in payload are not used by service if device_ptrs are set.
     }
 
     // 3. Prepare IPC message
@@ -230,14 +284,55 @@ int main(int argc, char *argv[]) {
     }
 
     // 7. Cleanup
-    free(response_msg_ptr);
-    free(h_A); free(h_B); free(h_C_expected); free(h_C_result_decrypted);
+    if(response_msg_ptr) free(response_msg_ptr); response_msg_ptr = NULL;
+
+    if (h_A) {
+        if (current_masking_level == MASKING_NONE) {
+            // Assuming CUDA_CHECK is robust or we add explicit error check for cudaFreeHost
+            printf("CLIENT_APP_GEMM_LOG: Freeing page-locked host memory for h_A.\n");
+            cudaFreeHost(h_A);
+        } else {
+            free(h_A);
+        }
+        h_A = NULL;
+    }
+    if (h_B) {
+        if (current_masking_level == MASKING_NONE) {
+            printf("CLIENT_APP_GEMM_LOG: Freeing page-locked host memory for h_B.\n");
+            cudaFreeHost(h_B);
+        } else {
+            free(h_B);
+        }
+        h_B = NULL;
+    }
+    if (h_C_expected) free(h_C_expected); h_C_expected = NULL;
+    if (h_C_result_decrypted) free(h_C_result_decrypted); h_C_result_decrypted = NULL;
+    
     printf("CLIENT_APP_GEMM_LOG: Client application finished successfully.\n");
     return EXIT_SUCCESS;
 
 cleanup_exit_resp:
-    if(response_msg_ptr) free(response_msg_ptr);
+    if(response_msg_ptr) free(response_msg_ptr); response_msg_ptr = NULL;
 cleanup_exit:
-    free(h_A); free(h_B); free(h_C_expected); free(h_C_result_decrypted);
+    // This cleanup path is taken on errors. Need to ensure correct freeing based on allocation type.
+    if (h_A) {
+        if (current_masking_level == MASKING_NONE && d_ptr_A != 0) { // d_ptr_A indicates cudaHostAlloc was attempted/successful
+             // No CUDA_CHECK here as we are already in an error path. Best effort.
+            cudaFreeHost(h_A);
+        } else if (current_masking_level == MASKING_AES_GCM) { // Check if it was malloc'd
+            free(h_A);
+        } // If d_ptr_A is 0 for MASKING_NONE, it means cudaHostAlloc failed before or h_A is uninit.
+        h_A = NULL;
+    }
+    if (h_B) {
+        if (current_masking_level == MASKING_NONE && d_ptr_B != 0) {
+            cudaFreeHost(h_B);
+        } else if (current_masking_level == MASKING_AES_GCM) {
+            free(h_B);
+        }
+        h_B = NULL;
+    }
+    if (h_C_expected) free(h_C_expected); h_C_expected = NULL;
+    if (h_C_result_decrypted) free(h_C_result_decrypted); h_C_result_decrypted = NULL;
     return EXIT_FAILURE;
 }

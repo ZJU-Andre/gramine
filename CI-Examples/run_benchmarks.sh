@@ -191,6 +191,10 @@ run_sgx_shared_vector_add() {
         return 1
     fi
 
+    if [ "$masking_mode" == "none" ]; then
+        echo "INFO: For SGX Shared Vector Add, '--masking none' now utilizes the Direct GPU DMA path."
+    fi
+
     log_message "Running Client Application for ${app_name} (Size: ${size}, Masking: ${masking_mode})..."
     # Client app (client_app.c) is updated to take --masking argument
     echo "Command: /usr/bin/time -v -o \"${result_prefix}_client.time\" gramine-sgx ${client_manifest} --masking ${masking_mode}"
@@ -341,6 +345,10 @@ run_sgx_shared_onnx() {
         return 1
     fi
 
+    if [ "$masking_mode" == "none" ]; then
+        echo "INFO: For SGX Shared ONNX Inference, '--masking none' now utilizes the Direct GPU DMA path."
+    fi
+
     log_message "Running Client Application for ${app_name} (Masking: ${masking_mode})..."
     echo "Command: /usr/bin/time -v -o \"${result_prefix}_client.time\" gramine-sgx ${client_manifest} --masking ${masking_mode}"
     (cd "${CLIENT_ENCLAVE_DIR}" && \
@@ -476,6 +484,10 @@ run_sgx_shared_gemm() {
     if ! ps -p "$(cat "${server_pid_file}")" > /dev/null; then
         log_message "ERROR: Shared service failed to start for ${app_name}. Check ${server_log}"
         return 1
+    fi
+
+    if [ "$masking_mode" == "none" ]; then
+        echo "INFO: For SGX Shared GEMM, '--masking none' now utilizes the Direct GPU DMA path."
     fi
 
     log_message "Running Client Application for ${app_name} (M=${M}, N=${N}, K=${K}, Masking: ${masking_mode})..."

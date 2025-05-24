@@ -1,5 +1,5 @@
 .. SPDX-License-Identifier: LGPL-3.0-or-later
-.. Copyright (C) 2023 Intel Corporation
+.. Copyright (C) 2023-2024 Intel Corporation
 
 ##################################################
 Performance Analysis of Shared Enclave GPU Architecture
@@ -14,7 +14,7 @@ Performance Analysis of Shared Enclave GPU Architecture
 
 Purpose
 -------
-The purpose of this document is to analyze the performance characteristics and overheads associated with the shared enclave GPU architecture in Gramine. This architecture is designed to allow multiple client enclaves to securely utilize a GPU managed by a central shared service enclave. A key feature explored is selective data masking, allowing for performance trade-offs based on data sensitivity.
+The purpose of this document is to analyze the performance characteristics and overheads associated with the shared enclave GPU architecture in Gramine. This architecture is designed to allow multiple client enclaves to securely utilize a GPU managed by a central shared service enclave. Key features explored include selective data masking (AES-GCM for high sensitivity, plaintext with optional Direct Memory Access (DMA) for low sensitivity) and their performance implications.
 
 Architecture Overview
 ---------------------
@@ -22,12 +22,12 @@ The architecture under test involves:
 *   **Client Enclaves:** Applications running in Gramine that require GPU-accelerated computations.
 *   **Shared Enclave:** A dedicated Gramine enclave that has direct access to the host GPU devices (e.g., ``/dev/nvidia*``). It receives computation requests from client enclaves.
 *   **Inter-Process Communication (IPC):** Client enclaves communicate with the shared enclave using Gramine's IPC mechanism (based on PAL pipes).
-*   **Selective Data Masking (AES-GCM / None):** Data transferred between client enclaves and the shared enclave for GPU processing can be either:
-    *   Protected using AES-GCM encryption and authentication (`MASKING_AES_GCM`).
-    *   Transferred as plaintext (`MASKING_NONE`) if deemed non-sensitive for direct GPU interaction.
-    The shared enclave is responsible for unmasking data (if encrypted) before GPU operations and re-masking results (if required by the chosen mode).
+*   **Selective Data Handling & Masking:** Data transferred between client enclaves and the shared enclave for GPU processing can be:
+    *   **Protected using AES-GCM (`MASKING_AES_GCM`):** Input and output data payloads are encrypted and authenticated. The shared enclave unmasks data before GPU operations and re-masks results. This provides the highest data confidentiality and integrity during transfer and within the shared enclave's CPU memory.
+    *   **Transferred as Plaintext with DMA (`MASKING_NONE` with client-provided device pointers):** For low-sensitivity data, clients can allocate pinned host memory, obtain device pointers to this memory, and send these pointers to the shared enclave. The shared enclave uses these device pointers directly (e.g., for VectorAdd, GEMM inputs) or via a Device-to-Device (DtoD) copy into an enclave-managed device buffer (e.g., for ONNX inputs) for GPU operations. This path aims to minimize data copies and CPU overhead.
+    *   **Transferred as Plaintext in IPC Payload (`MASKING_NONE` without client-provided device pointers):** If device pointers are not provided, plaintext data is copied into the IPC message and then from the shared enclave's CPU memory to the GPU. This is less performant than DMA but still avoids cryptographic overhead.
 
-This analysis aims to quantify the performance impact of these components, particularly the IPC and data masking overheads, relative to native execution, a non-SGX Gramine (direct mode) execution, and between the different masking modes within SGX.
+This analysis aims to quantify the performance impact of these components, particularly IPC, data masking/copying overheads, and the benefits of the DMA path, relative to native execution and a non-SGX Gramine (direct mode) execution.
 
 2. Benchmarking Methodology
 ===========================
@@ -42,13 +42,14 @@ Each benchmark application is run in the following modes:
 
 1.  **Native Linux:** Baseline.
 2.  **Gramine-direct:** Isolates Gramine LibOS/PAL overhead without SGX.
-3.  **Gramine SGX (AES-GCM Masking):** Shared enclave model with full AES-GCM encryption/decryption of GPU data payloads.
-4.  **Gramine SGX (No GPU Masking / Plaintext):** Shared enclave model where GPU data payloads are transferred as plaintext between client and shared enclave (via IPC). Other IPC control data might still be implicitly protected by the IPC channel itself, but the large GPU buffers are not explicitly encrypted by the application layer.
+3.  **Gramine SGX (AES-GCM Masking):** Shared enclave model with full AES-GCM encryption/decryption of GPU data payloads. Data is copied into and out of the shared enclave.
+4.  **Gramine SGX (`MASKING_NONE` with DMA):** Shared enclave model where client-provided device pointers for input data are used by the service. Data is considered plaintext from the client's perspective for GPU processing. This is the primary "No GPU Masking" mode discussed for performance benefits.
+5.  **(Optional) Gramine SGX (`MASKING_NONE` via IPC Copy):** Shared enclave model where plaintext GPU data payloads are copied via IPC between client and shared enclave. This mode is implicitly used if `MASKING_NONE` is selected but the client does not provide device pointers. It serves as a comparison point to isolate DMA benefits from mere crypto elimination.
 
 Metrics Collected
 -----------------
 (Unchanged from previous version - End-to-End Time, Internal GPU Time, SGX Mode Time Breakdown, System-Level Stats)
-The SGX Mode Time Breakdown will be particularly important to compare between "AES-GCM Masking" and "No GPU Masking" modes.
+The SGX Mode Time Breakdown will be particularly important to compare between "AES-GCM Masking", "No GPU Masking (DMA)", and potentially "No GPU Masking (IPC Copy)" modes.
 
 Hardware/Software Environment
 -----------------------------
@@ -68,255 +69,224 @@ Vector Addition
 
 **Table 1: Vector Addition - End-to-End Execution Time (seconds)**
 
-+----------------------+----------+-----------------+---------------------------+---------------------------------+
-| Workload (Elements)  | Native   | Gramine-direct  | Gramine SGX (AES-GCM)     | Gramine SGX (No GPU Masking)  |
-+======================+==========+=================+===========================+=================================+
-| 2^20 (approx 1M)     | [time_n1]| [time_gd1]      | [time_sgx_aes1]           | [time_sgx_none1]                |
-+----------------------+----------+-----------------+---------------------------+---------------------------------+
-| 2^22 (approx 4M)     | [time_n2]| [time_gd2]      | [time_sgx_aes2]           | [time_sgx_none2]                |
-+----------------------+----------+-----------------+---------------------------+---------------------------------+
-| 2^24 (approx 16M)    | [time_n3]| [time_gd3]      | [time_sgx_aes3]           | [time_sgx_none3]                |
-+----------------------+----------+-----------------+---------------------------+---------------------------------+
++----------------------+----------+-----------------+---------------------------+---------------------------------------+
+| Workload (Elements)  | Native   | Gramine-direct  | Gramine SGX (AES-GCM)     | Gramine SGX (`MASKING_NONE` with DMA) |
++======================+==========+=================+===========================+=======================================+
+| 2^20 (approx 1M)     | [time_n1]| [time_gd1]      | [time_sgx_aes1]           | [time_sgx_dma1]                       |
++----------------------+----------+-----------------+---------------------------+---------------------------------------+
+| 2^22 (approx 4M)     | [time_n2]| [time_gd2]      | [time_sgx_aes2]           | [time_sgx_dma2]                       |
++----------------------+----------+-----------------+---------------------------+---------------------------------------+
+| 2^24 (approx 16M)    | [time_n3]| [time_gd3]      | [time_sgx_aes3]           | [time_sgx_dma3]                       |
++----------------------+----------+-----------------+---------------------------+---------------------------------------+
 
 **Table 2: Vector Addition - Calculated Overheads vs Native**
 
-+----------------------+---------------------------+-----------------------------------+----------------------------------------+
-| Workload (Elements)  | Gramine-direct Overhead % | Gramine SGX (AES-GCM) Ovhd. %     | Gramine SGX (No GPU Masking) Ovhd. % |
-+======================+===========================+===================================+========================================+
-| 2^20                 | [ovhd_gd1]%               | [ovhd_sgx_aes1]%                  | [ovhd_sgx_none1]%                      |
-+----------------------+---------------------------+-----------------------------------+----------------------------------------+
-| 2^22                 | [ovhd_gd2]%               | [ovhd_sgx_aes2]%                  | [ovhd_sgx_none2]%                      |
-+----------------------+---------------------------+-----------------------------------+----------------------------------------+
-| 2^24                 | [ovhd_gd3]%               | [ovhd_sgx_aes3]%                  | [ovhd_sgx_none3]%                      |
-+----------------------+---------------------------+-----------------------------------+----------------------------------------+
++----------------------+---------------------------+-----------------------------------+-----------------------------------------------+
+| Workload (Elements)  | Gramine-direct Overhead % | Gramine SGX (AES-GCM) Ovhd. %     | Gramine SGX (`MASKING_NONE` with DMA) Ovhd. % |
++======================+===========================+===================================+===============================================+
+| 2^20                 | [ovhd_gd1]%               | [ovhd_sgx_aes1]%                  | [ovhd_sgx_dma1]%                              |
++----------------------+---------------------------+-----------------------------------+-----------------------------------------------+
+| 2^22                 | [ovhd_gd2]%               | [ovhd_sgx_aes2]%                  | [ovhd_sgx_dma2]%                              |
++----------------------+---------------------------+-----------------------------------+-----------------------------------------------+
+| 2^24                 | [ovhd_gd3]%               | [ovhd_sgx_aes3]%                  | [ovhd_sgx_dma3]%                              |
++----------------------+---------------------------+-----------------------------------+-----------------------------------------------+
 
 **Table 3.1: Vector Addition @ 2^22 Elements - SGX (AES-GCM Masking) Time Breakdown (ms - Hypothetical)**
+*(Existing table structure is fine, ensure components reflect client-side masking and shared enclave unmasking + masking of results)*
+
+**Table 3.2: Vector Addition @ 2^22 Elements - SGX (`MASKING_NONE` with DMA) Time Breakdown (ms - Hypothetical)**
 
 +---------------------------------+------------+
 | Component                       | Time (ms)  |
 +=================================+============+
-| Client: Data Prep & Masking     | [time_c_prep_mask_va] |
+| Client: Pinned Mem Alloc & Ptr  | [time_c_pinalloc_va] |
 +---------------------------------+------------+
-| Client: IPC Send + Wait         | [time_c_ipc_va_aes]   |
+| Client: IPC Send (Pointers) + Wait| [time_c_ipc_va_dma]   |
 +---------------------------------+------------+
-| Client: Data Unmask & Verify  | [time_c_unmask_ver_va] |
+| Client: Result Verify (No Unmask)| [time_c_ver_nounmask_va] |
 +---------------------------------+------------+
-| Shared Enc: IPC Recv & Unmask | [time_s_ipc_unmask_va] |
+| Shared Enc: IPC Recv (Pointers) | [time_s_ipc_recv_ptrs_va]|
 +---------------------------------+------------+
-| Shared Enc: GPU Execution (CUDA)| [time_s_gpu_va]       |
+| Shared Enc: GPU Exec (Direct DMA)| [time_s_gpu_va_dma]   | <!-- Kernel uses client pointers -->
 +---------------------------------+------------+
-| Shared Enc: Data Mask & IPC Send| [time_s_mask_ipc_va]  |
+| Shared Enc: Result Prep (No Mask)| [time_s_prep_res_va]  | <!-- Memcpy result to response payload -->
 +---------------------------------+------------+
-| **Client End-to-End Total**     | [time_c_total_va_aes] |
-+---------------------------------+------------+
-
-**Table 3.2: Vector Addition @ 2^22 Elements - SGX (No GPU Masking) Time Breakdown (ms - Hypothetical)**
-
-+---------------------------------+------------+
-| Component                       | Time (ms)  |
-+=================================+============+
-| Client: Data Prep (No Masking)  | [time_c_prep_nomask_va] | <!-- Primarily memcpy -->
-+---------------------------------+------------+
-| Client: IPC Send + Wait         | [time_c_ipc_va_none]  |
-+---------------------------------+------------+
-| Client: Data Verify (No Unmask) | [time_c_ver_nounmask_va] |
-+---------------------------------+------------+
-| Shared Enc: IPC Recv (No Unmask)| [time_s_ipc_nounmask_va] |
-+---------------------------------+------------+
-| Shared Enc: GPU Execution (CUDA)| [time_s_gpu_va]       | <!-- Same as AES-GCM case -->
-+---------------------------------+------------+
-| Shared Enc: Data Prep (No Mask) | [time_s_prep_nomask_va] | <!-- Primarily memcpy for response -->
-+---------------------------------+------------+
-| **Client End-to-End Total**     | [time_c_total_va_none]|
+| **Client End-to-End Total**     | [time_c_total_va_dma] |
 +---------------------------------+------------+
 
 **Hypothetical Discussion Points (Vector Addition):**
     *   (Discussion on Native and Gramine-direct from previous version remains relevant)
     *   **Gramine SGX (AES-GCM) Overhead:** As discussed before, this is expected to be high due to masking and IPC for large vector data relative to fast kernel execution.
-    *   **Gramine SGX (No GPU Masking) Overhead:** This mode eliminates the AES-GCM processing time. The overhead compared to Gramine-direct will primarily be due to IPC data copying and SGX transitions. Expected to be significantly faster than AES-GCM mode for this benchmark.
-    *   **Comparison:** The difference between `[time_sgx_aesN]` and `[time_sgx_noneN]` will directly show the cost of AES-GCM for 3*N*elements*sizeof(float) data.
-    *   **Breakdown Analysis:** For "No GPU Masking", the masking/unmasking components in Table 3.2 will be near zero or represent simple memory copy times. The IPC time might also be slightly lower if not sending IVs/tags, but the bulk data copy for payloads remains.
+    *   **Gramine SGX (`MASKING_NONE` with DMA) Overhead:** This mode eliminates AES-GCM processing and also avoids copying the large input data buffers (B and C) into the shared enclave's memory and then again to the GPU. The overhead compared to Gramine-direct will primarily be due to SGX transitions for IPC and CUDA API calls from the shared enclave, and the initial pinned memory allocation by the client. Expected to be significantly faster than AES-GCM mode and also faster than a non-DMA `MASKING_NONE` (IPC copy) path.
+    *   **Comparison:** The difference between `[time_sgx_aesN]` and `[time_sgx_dmaN]` will show the combined benefit of eliminating AES-GCM and reducing data copies.
+    *   **Breakdown Analysis:** For `MASKING_NONE` with DMA (Table 3.2), masking/unmasking components are zero. Data preparation on the client involves `cudaHostAlloc` and `cudaHostGetDevicePointer`. The shared enclave's "IPC Recv" time should be minimal as only pointers are transferred for inputs. GPU execution directly uses client's device memory.
 
 ONNX Model Inference (MobileNetV2)
 ----------------------------------
 
 **Table 4: ONNX MobileNetV2 - End-to-End Execution Time (seconds)**
 
-+----------------------+----------+-----------------+---------------------------+---------------------------------+
-| Workload             | Native   | Gramine-direct  | Gramine SGX (AES-GCM)     | Gramine SGX (No GPU Masking)  |
-+======================+==========+=================+===========================+=================================+
-| MobileNetV2          | [time_n_onnx]| [time_gd_onnx]  | [time_sgx_aes_onnx]       | [time_sgx_none_onnx]            |
-+----------------------+----------+-----------------+---------------------------+---------------------------------+
++----------------------+----------+-----------------+---------------------------+---------------------------------------+
+| Workload             | Native   | Gramine-direct  | Gramine SGX (AES-GCM)     | Gramine SGX (`MASKING_NONE` with DMA) |
++======================+==========+=================+===========================+=======================================+
+| MobileNetV2          | [time_n_onnx]| [time_gd_onnx]  | [time_sgx_aes_onnx]       | [time_sgx_dma_onnx]                   |
++----------------------+----------+-----------------+---------------------------+---------------------------------------+
 
 **Table 5: ONNX MobileNetV2 - Calculated Overheads vs Native**
 
-+----------------------+---------------------------+-----------------------------------+----------------------------------------+
-| Workload             | Gramine-direct Overhead % | Gramine SGX (AES-GCM) Ovhd. %     | Gramine SGX (No GPU Masking) Ovhd. % |
-+======================+===========================+===================================+========================================+
-| MobileNetV2          | [ovhd_gd_onnx]%           | [ovhd_sgx_aes_onnx]%              | [ovhd_sgx_none_onnx]%                  |
-+----------------------+---------------------------+-----------------------------------+----------------------------------------+
++----------------------+---------------------------+-----------------------------------+-----------------------------------------------+
+| Workload             | Gramine-direct Overhead % | Gramine SGX (AES-GCM) Ovhd. %     | Gramine SGX (`MASKING_NONE` with DMA) Ovhd. % |
++======================+===========================+===================================+===============================================+
+| MobileNetV2          | [ovhd_gd_onnx]%           | [ovhd_sgx_aes_onnx]%              | [ovhd_sgx_dma_onnx]%                          |
++----------------------+---------------------------+-----------------------------------+-----------------------------------------------+
 
 **Table 6.1: ONNX MobileNetV2 - SGX (AES-GCM Masking) Time Breakdown (ms - Hypothetical)**
+*(Existing table structure is fine)*
+
+**Table 6.2: ONNX MobileNetV2 - SGX (`MASKING_NONE` with DMA) Time Breakdown (ms - Hypothetical)**
 
 +---------------------------------+------------+
 | Component                       | Time (ms)  |
 +=================================+============+
-| Client: Input Prep & Masking    | [time_c_prep_mask_onnx] |
+| Client: Input Pinned Alloc & Ptr| [time_c_pinalloc_onnx] |
 +---------------------------------+------------+
-| Client: IPC Send + Wait         | [time_c_ipc_onnx_aes]   |
-+---------------------------------+------------+
-| Client: Output Unmask & Process | [time_c_unmask_ver_onnx] |
-+---------------------------------+------------+
-| Shared Enc: IPC Recv & Unmask | [time_s_ipc_unmask_onnx] |
-+---------------------------------+------------+
-| Shared Enc: GPU Execution (ORT) | [time_s_gpu_onnx]       |
-+---------------------------------+------------+
-| Shared Enc: Output Mask & IPC Send| [time_s_mask_ipc_onnx]  |
-+---------------------------------+------------+
-| **Client End-to-End Total**     | [time_c_total_onnx_aes] |
-+---------------------------------+------------+
-
-**Table 6.2: ONNX MobileNetV2 - SGX (No GPU Masking) Time Breakdown (ms - Hypothetical)**
-
-+---------------------------------+------------+
-| Component                       | Time (ms)  |
-+=================================+============+
-| Client: Input Prep (No Masking) | [time_c_prep_nomask_onnx] |
-+---------------------------------+------------+
-| Client: IPC Send + Wait         | [time_c_ipc_onnx_none]  |
+| Client: IPC Send (Ptr) + Wait   | [time_c_ipc_onnx_dma]   |
 +---------------------------------+------------+
 | Client: Output Process(No Unmask)| [time_c_ver_nounmask_onnx] |
 +---------------------------------+------------+
-| Shared Enc: IPC Recv (No Unmask)| [time_s_ipc_nounmask_onnx] |
+| Shared Enc: IPC Recv (Ptr)      | [time_s_ipc_recv_ptr_onnx]|
 +---------------------------------+------------+
-| Shared Enc: GPU Execution (ORT) | [time_s_gpu_onnx]       |
+| Shared Enc: DtoD Copy & GPU Exec| [time_s_dtod_gpu_onnx]  | <!-- DtoD + ORT Run -->
 +---------------------------------+------------+
 | Shared Enc: Output Prep (No Mask)| [time_s_prep_nomask_onnx] |
 +---------------------------------+------------+
-| **Client End-to-End Total**     | [time_c_total_onnx_none]|
+| **Client End-to-End Total**     | [time_c_total_onnx_dma]|
 +---------------------------------+------------+
 
 **Hypothetical Discussion Points (ONNX MobileNetV2):**
     *   (Discussion on Native and Gramine-direct from previous version remains relevant)
-    *   **Gramine SGX (AES-GCM) Overhead:** Masking the ~600KB input tensor will be the primary crypto overhead. Output is small.
-    *   **Gramine SGX (No GPU Masking) Overhead:** Eliminates AES-GCM for the ~600KB input and ~4KB output. The performance gain should be noticeable and primarily reflect the cost of encrypting/decrypting the input tensor.
-    *   **Comparison:** The difference between SGX modes will quantify the AES-GCM cost for ~604KB of data. Given that GPU execution for MobileNetV2 is fast, this saving can be a significant portion of the SGX overhead.
-    *   **Breakdown Analysis:** Table 6.2 will show near-zero times for masking/unmasking components. The core GPU time remains the same.
+    *   **Gramine SGX (AES-GCM) Overhead:** Masking the ~600KB input tensor will be the primary crypto overhead.
+    *   **Gramine SGX (`MASKING_NONE` with DMA) Overhead:** Eliminates AES-GCM for the input. The shared enclave performs a Device-to-Device (DtoD) copy from the client's device memory to an enclave-managed device buffer before ONNX Runtime execution. This is faster than HtoD copies and avoids CPU overhead for data handling.
+    *   **Comparison:** The difference between SGX modes will quantify the AES-GCM cost plus the benefit of avoiding HtoD copies from enclave CPU memory for the input tensor.
+    *   **Breakdown Analysis:** Table 6.2 will show no masking/unmasking time. The "DtoD Copy & GPU Exec" component in the shared enclave will be key.
 
 cuBLAS GEMM (SGEMM)
 -------------------
 
 **Table 7: cuBLAS SGEMM - End-to-End Execution Time (seconds)**
 
-+----------------------+----------+-----------------+---------------------------+---------------------------------+
-| Workload (MxN, K)    | Native   | Gramine-direct  | Gramine SGX (AES-GCM)     | Gramine SGX (No GPU Masking)  |
-+======================+==========+=================+===========================+=================================+
-| 512x512, K=512       | [time_n_g1]| [time_gd_g1]    | [time_sgx_aes_g1]         | [time_sgx_none_g1]              |
-+----------------------+----------+-----------------+---------------------------+---------------------------------+
-| 1024x1024, K=1024    | [time_n_g2]| [time_gd_g2]    | [time_sgx_aes_g2]         | [time_sgx_none_g2]              |
-+----------------------+----------+-----------------+---------------------------+---------------------------------+
-| 2048x2048, K=2048    | [time_n_g3]| [time_gd_g3]    | [time_sgx_aes_g3]         | [time_sgx_none_g3]              |
-+----------------------+----------+-----------------+---------------------------+---------------------------------+
++----------------------+----------+-----------------+---------------------------+---------------------------------------+
+| Workload (MxN, K)    | Native   | Gramine-direct  | Gramine SGX (AES-GCM)     | Gramine SGX (`MASKING_NONE` with DMA) |
++======================+==========+=================+===========================+=======================================+
+| 512x512, K=512       | [time_n_g1]| [time_gd_g1]    | [time_sgx_aes_g1]         | [time_sgx_dma_g1]                     |
++----------------------+----------+-----------------+---------------------------+---------------------------------------+
+| 1024x1024, K=1024    | [time_n_g2]| [time_gd_g2]    | [time_sgx_aes_g2]         | [time_sgx_dma_g2]                     |
++----------------------+----------+-----------------+---------------------------+---------------------------------------+
+| 2048x2048, K=2048    | [time_n_g3]| [time_gd_g3]    | [time_sgx_aes_g3]         | [time_sgx_dma_g3]                     |
++----------------------+----------+-----------------+---------------------------+---------------------------------------+
 
 **Table 8: cuBLAS SGEMM - Calculated Overheads vs Native**
 
-+----------------------+---------------------------+-----------------------------------+----------------------------------------+
-| Workload (MxN, K)    | Gramine-direct Overhead % | Gramine SGX (AES-GCM) Ovhd. %     | Gramine SGX (No GPU Masking) Ovhd. % |
-+======================+===========================+===================================+========================================+
-| 512x512, K=512       | [ovhd_gd_g1]%             | [ovhd_sgx_aes_g1]%                | [ovhd_sgx_none_g1]%                    |
-+----------------------+---------------------------+-----------------------------------+----------------------------------------+
-| 1024x1024, K=1024    | [ovhd_gd_g2]%             | [ovhd_sgx_aes_g2]%                | [ovhd_sgx_none_g2]%                    |
-+----------------------+---------------------------+-----------------------------------+----------------------------------------+
-| 2048x2048, K=2048    | [ovhd_gd_g3]%             | [ovhd_sgx_aes_g3]%                | [ovhd_sgx_none_g3]%                    |
-+----------------------+---------------------------+-----------------------------------+----------------------------------------+
++----------------------+---------------------------+-----------------------------------+-----------------------------------------------+
+| Workload (MxN, K)    | Gramine-direct Overhead % | Gramine SGX (AES-GCM) Ovhd. %     | Gramine SGX (`MASKING_NONE` with DMA) Ovhd. % |
++======================+===========================+===================================+===============================================+
+| 512x512, K=512       | [ovhd_gd_g1]%             | [ovhd_sgx_aes_g1]%                | [ovhd_sgx_dma_g1]%                            |
++----------------------+---------------------------+-----------------------------------+-----------------------------------------------+
+| 1024x1024, K=1024    | [ovhd_gd_g2]%             | [ovhd_sgx_aes_g2]%                | [ovhd_sgx_dma_g2]%                            |
++----------------------+---------------------------+-----------------------------------+-----------------------------------------------+
+| 2048x2048, K=2048    | [ovhd_gd_g3]%             | [ovhd_sgx_aes_g3]%                | [ovhd_sgx_dma_g3]%                            |
++----------------------+---------------------------+-----------------------------------+-----------------------------------------------+
 
 **Table 9.1: cuBLAS SGEMM @ 1024x1024, K=1024 - SGX (AES-GCM Masking) Time Breakdown (ms - Hypothetical)**
+*(Existing table structure is fine)*
+
+**Table 9.2: cuBLAS SGEMM @ 1024x1024, K=1024 - SGX (`MASKING_NONE` with DMA) Time Breakdown (ms - Hypothetical)**
 
 +---------------------------------+------------+
 | Component                       | Time (ms)  |
 +=================================+============+
-| Client: Matrix Prep & Masking   | [time_c_prep_mask_gemm] |
+| Client: Matrix Pinned Alloc&Ptrs| [time_c_pinalloc_gemm] |
 +---------------------------------+------------+
-| Client: IPC Send + Wait         | [time_c_ipc_gemm_aes]   |
+| Client: IPC Send (Ptrs) + Wait  | [time_c_ipc_gemm_dma]   |
 +---------------------------------+------------+
-| Client: Result Unmask & Verify  | [time_c_unmask_ver_gemm] |
+| Client: Result Verify(No Unmask)| [time_c_ver_nounmask_gemm] |
 +---------------------------------+------------+
-| Shared Enc: IPC Recv & Unmask | [time_s_ipc_unmask_gemm] |
+| Shared Enc: IPC Recv (Ptrs)     | [time_s_ipc_recv_ptrs_gemm]|
 +---------------------------------+------------+
-| Shared Enc: GPU Execution (cuBLAS)| [time_s_gpu_gemm]       |
+| Shared Enc: GPU Exec(Direct DMA)| [time_s_gpu_gemm_dma]   | <!-- cuBLAS uses client pointers -->
 +---------------------------------+------------+
-| Shared Enc: Result Mask & IPC Send| [time_s_mask_ipc_gemm]  |
+| Shared Enc: Result Prep (No Mask)| [time_s_prep_res_gemm]  |
 +---------------------------------+------------+
-| **Client End-to-End Total**     | [time_c_total_gemm_aes] |
-+---------------------------------+------------+
-
-**Table 9.2: cuBLAS SGEMM @ 1024x1024, K=1024 - SGX (No GPU Masking) Time Breakdown (ms - Hypothetical)**
-
-+---------------------------------+------------+
-| Component                       | Time (ms)  |
-+=================================+============+
-| Client: Matrix Prep (No Masking)| [time_c_prep_nomask_gemm] |
-+---------------------------------+------------+
-| Client: IPC Send + Wait         | [time_c_ipc_gemm_none]  |
-+---------------------------------+------------+
-| Client: Result Verify (No Unmask)| [time_c_ver_nounmask_gemm] |
-+---------------------------------+------------+
-| Shared Enc: IPC Recv (No Unmask)| [time_s_ipc_nounmask_gemm] |
-+---------------------------------+------------+
-| Shared Enc: GPU Execution (cuBLAS)| [time_s_gpu_gemm]       |
-+---------------------------------+------------+
-| Shared Enc: Result Prep (No Mask)| [time_s_prep_nomask_gemm] |
-+---------------------------------+------------+
-| **Client End-to-End Total**     | [time_c_total_gemm_none]|
+| **Client End-to-End Total**     | [time_c_total_gemm_dma]|
 +---------------------------------+------------+
 
 **Hypothetical Discussion Points (cuBLAS GEMM):**
     *   (Discussion on Native and Gramine-direct from previous version remains relevant)
-    *   **Gramine SGX (AES-GCM) Overhead:** For large matrices, AES-GCM processing on multiple megabytes (e.g., 2MB for inputs, 1MB for output for 512^2; 8MB inputs, 4MB output for 1024^2) will be very substantial.
-    *   **Gramine SGX (No GPU Masking) Overhead:** This will show a significant improvement over AES-GCM mode. The remaining overhead vs. Gramine-direct will be due to IPC of large plaintext matrices and SGX transitions.
-    *   **Comparison:** The time difference between `[time_sgx_aes_gN]` and `[time_sgx_none_gN]` will highlight the direct cost of cryptographic protection for large data arrays.
-    *   **Breakdown Analysis:** In "No GPU Masking" mode (Table 9.2), the masking/unmasking times become negligible. The IPC time might still be high due to large data copies. The GPU execution time remains the core compute part. For very large matrices, GPU time will still likely dominate even in "No GPU Masking" SGX mode.
+    *   **Gramine SGX (AES-GCM) Overhead:** AES-GCM on large matrices will be substantial.
+    *   **Gramine SGX (`MASKING_NONE` with DMA) Overhead:** Similar to VectorAdd, this mode avoids crypto and data copies for input matrices A and B into the shared enclave, using client's device pointers directly. This should yield significant performance improvements.
+    *   **Comparison:** The difference between `[time_sgx_aes_gN]` and `[time_sgx_dma_gN]` will highlight the benefits.
+    *   **Breakdown Analysis:** Table 9.2 will show minimal client and shared enclave data prep time for inputs. GPU execution time should be similar to native, with IPC and SGX transition costs being the main overheads.
 
-4. Analysis and Bottleneck Identification (Hypothetical)
-========================================================
+4. Analysis and Bottleneck Identification
+=========================================
 
-(The existing discussion on "Impact of Data Size on Overhead", "Impact of GPU Computation Intensity vs. Communication/Security Overheads", and "Primary Bottlenecks in SGX Shared Enclave Mode" remains largely relevant.)
+Impact of Data Transfer Mechanisms and Masking
+----------------------------------------------
+The shared enclave architecture offers different mechanisms for data handling, each with distinct performance and security trade-offs:
 
-**NEW SUBSECTION:**
+*   **`MASKING_AES_GCM` (Data Copy & Cryptography):**
+    *   **Pros:** Highest security for data in transit (IPC) and at rest in the shared enclave's CPU memory.
+    *   **Cons:** Significant overhead from AES-GCM encryption/decryption on both client and shared enclave sides. Additionally, data is copied multiple times (client host -> client enclave -> IPC -> shared enclave -> shared enclave host -> GPU device memory, and reverse for results).
+    *   **Bottlenecks:** Cryptographic operations, multiple memory copies across protection boundaries, and IPC serialization/deserialization.
 
-Impact of Selective Data Masking (AES-GCM vs. No Masking)
+*   **`MASKING_NONE` with IPC Copy (Data Copy, No Cryptography):**
+    *   **Pros:** Eliminates cryptographic overhead compared to AES-GCM.
+    *   **Cons:** Still involves multiple memory copies (client host -> client enclave -> IPC -> shared enclave -> shared enclave host -> GPU device memory). Data is plaintext in IPC and shared enclave CPU memory.
+    *   **Bottlenecks:** Multiple memory copies, IPC overhead. Performance is better than AES-GCM but not optimal for large data.
+
+*   **`MASKING_NONE` with Direct GPU DMA (Pointer Passing, Minimal Copies for Inputs):**
+    *   **Pros:**
+        *   Eliminates cryptographic overhead.
+        *   For input data, significantly reduces memory copies. Client allocates pinned host memory, obtains a device pointer, and sends this pointer.
+            *   For VectorAdd and GEMM, the shared enclave can use these client device pointers *directly* in CUDA kernels or cuBLAS calls, avoiding any data copy of inputs within the shared enclave.
+            *   For ONNX, the current implementation has the shared enclave perform a Device-to-Device (DtoD) copy from the client's device memory region to an enclave-managed device buffer. While this is a copy, a DtoD copy is generally much faster than Host-to-Device (HtoD) copies and avoids involving enclave CPU memory for the bulk data.
+        *   This path offers the lowest latency and highest throughput for transferring low-sensitivity input data to the GPU.
+    *   **Cons:**
+        *   Security: Input data is exposed on the host (pinned memory), PCIe bus, and GPU device memory. This path is only suitable for non-sensitive data.
+        *   Complexity: Requires client to manage CUDA pinned memory and device pointers.
+    *   **Bottlenecks:** SGX transitions (ECALLs/OCALLs) for IPC and CUDA driver interactions from the shared enclave. For ONNX, the DtoD copy is an additional step, though efficient. Output data is still typically copied back via shared enclave CPU memory.
+
+**Expected Performance Impact of DMA:**
+The `MASKING_NONE` with DMA path is expected to be the most performant SGX mode for GPU workloads involving large input datasets. By avoiding both cryptographic operations and the expensive memory copies of input data through enclave CPU memory (and subsequent HtoD copies), it directly addresses major overheads. For operations where the shared enclave can use the client's device pointer directly (VectorAdd, GEMM), the input data transfer overhead from the shared enclave's perspective is minimized to simply receiving the pointer via IPC. For ONNX, the DtoD copy is an efficient way to transfer data already in device memory into a space usable by the ONNX runtime within the shared enclave.
+
+Security Implications of `MASKING_NONE` (DMA or IPC Copy)
 ---------------------------------------------------------
-The introduction of `gpu_data_masking_level_t` allows for a direct comparison of performance when AES-GCM data masking is enabled versus when data is transferred as plaintext for GPU operations within the SGX shared enclave model.
+It is crucial to reiterate that `MASKING_NONE` (whether using DMA or IPC copy for plaintext) means that the GPU data payloads are transferred between enclaves as plaintext and will reside in GPU memory as plaintext. This data is vulnerable to observation by a compromised host OS/hypervisor while on the PCIe bus or in GPU device memory.
+This mode should **only** be used if the specific data being processed by the GPU is deemed non-sensitive. The decision must be a careful trade-off between performance and security.
 
-*   **Performance Gains from `MASKING_NONE`:**
-    *   The most significant performance gain from using `MASKING_NONE` is the elimination of CPU-bound AES-GCM encryption and decryption operations on the data payloads (input and output) for each GPU task. This gain is directly proportional to the size of the data being processed. For benchmarks like GEMM with large matrices or ONNX with large input tensors, the time saved from crypto operations can be substantial (potentially reducing this component of overhead to near zero).
-    *   Vector Addition, especially with smaller vectors, might see a very large *relative* improvement when switching to `MASKING_NONE`, as crypto overhead likely dominated its AES-GCM SGX runtime. For ONNX and GEMM, while the absolute time saved by omitting crypto will be larger due to larger data sizes, the *relative* percentage improvement in end-to-end time might be more moderate if the GPU computation itself is already a large portion of the total time.
-*   **Remaining Overheads in `MASKING_NONE` SGX Mode:**
-    *   **IPC Data Transfer:** Data (now plaintext) still needs to be copied between the client and shared enclaves via the IPC mechanism. This involves memory copies and context switches (ECALLs/OCALLs for PAL pipe operations). For large data, this remains a bottleneck.
-    *   **SGX Transitions:** ECALLs/OCALLs for IPC and for the shared enclave to interact with the CUDA driver (e.g., `cudaMalloc`, `cudaMemcpy`, kernel launch, `cublasSgemm`, `OrtRun`) are still incurred. These contribute to latency.
-    *   **LibOS/PAL Overheads:** The general overhead of running within the Gramine LibOS and PAL layers (syscall translation, internal bookkeeping) still applies.
-*   **Security Implications of `MASKING_NONE`:**
-    *   It is crucial to reiterate that `MASKING_NONE` means that the GPU data payloads are transferred between enclaves as plaintext and will reside in GPU memory as plaintext. This data is vulnerable to observation by a compromised host OS/hypervisor while on the PCIe bus or in GPU device memory.
-    *   This mode should **only** be used if the specific data being processed by the GPU is deemed non-sensitive, or if other external factors mitigate the risk (e.g., a physically secured system where host threats are not a concern for this specific data, though this typically negates the primary motivation for using SGX).
-    *   The decision to use `MASKING_NONE` must be a careful trade-off between performance needs and the security requirements of the data and application. It effectively reduces the TCB for that specific data from SGX protection down to the security level of the GPU hardware and driver stack during GPU processing.
+Handling Mixed-Sensitivity Workloads
+------------------------------------
+A significant advantage of the selective data handling mechanism (choosing between `MASKING_AES_GCM` and `MASKING_NONE` with DMA per request) is the ability to efficiently manage workloads with mixed data sensitivities. Applications can:
+*   Use `MASKING_AES_GCM` for processing sensitive data segments, ensuring their confidentiality and integrity.
+*   Switch to `MASKING_NONE` with DMA for non-sensitive data segments within the same application or workflow, benefiting from significantly higher performance for those parts.
+This flexibility allows developers to strike an optimal balance between security and performance, applying strong protections where necessary and leveraging performance optimizations where the data's sensitivity permits. For instance, a complex AI pipeline might process sensitive user metadata with AES-GCM, while bulk image pixel data (if deemed non-sensitive after initial processing) could be handled via the DMA path for faster GPU acceleration.
 
 5. Conclusions and Recommendations (Hypothetical)
 =================================================
 
 *   **Performance Characteristics Summary:**
-    *   (Gramine-direct conclusions remain the same)
-    *   Gramine SGX (Shared Enclave) with `MASKING_AES_GCM` provides the highest level of data protection for GPU payloads exchanged with the shared enclave but incurs significant performance overhead due to cryptography and IPC.
-    *   Gramine SGX (Shared Enclave) with `MASKING_NONE` offers a substantial performance improvement over the AES-GCM mode by eliminating cryptographic overhead. The remaining overhead compared to Gramine-direct is primarily due to IPC data copies and SGX transition costs.
+    *   Gramine SGX (Shared Enclave) with `MASKING_AES_GCM` provides the highest data protection but incurs significant overhead.
+    *   Gramine SGX (Shared Enclave) with `MASKING_NONE` via IPC copy improves performance by removing crypto but still suffers from data copy overhead.
+    *   Gramine SGX (Shared Enclave) with `MASKING_NONE` and **DMA** offers the best performance for low-sensitivity data by eliminating crypto and drastically reducing data copy overheads for inputs.
 *   **Recommendations for Use:**
-    *   (Recommendations for AES-GCM mode remain the same)
-    *   The `MASKING_NONE` option within the SGX shared enclave model should be used cautiously. It is appropriate for scenarios where:
-        *   The specific data being offloaded to the GPU is determined to be non-sensitive or of sufficiently low value that its exposure outside the CPU TEE boundary (on PCIe bus, in GPU RAM) is an acceptable risk.
-        *   Performance is critical, and the overhead of AES-GCM is prohibitive for the application's requirements.
-    *   **A thorough risk assessment is essential before opting for `MASKING_NONE` for any production data.** The security guarantees for data processed via this path are significantly different from data processed under `MASKING_AES_GCM`.
-    *   Even with `MASKING_NONE`, the shared enclave architecture still provides isolation for the service logic itself and can protect other sensitive assets within the shared enclave (like the ONNX model parameters if they are not part of the "masked" data, or cryptographic keys used for other purposes).
+    *   Use `MASKING_AES_GCM` when data confidentiality for GPU payloads is paramount.
+    *   The `MASKING_NONE` with DMA option is highly recommended for performance-critical operations on non-sensitive data, offering substantial speedups.
+    *   **A thorough risk assessment is essential before opting for `MASKING_NONE` (DMA or IPC copy) for any production data.**
+    *   Leverage the per-request masking choice to efficiently process mixed-sensitivity workloads.
 *   **Potential Future Optimization Areas:**
     *   (Existing points remain relevant)
-    *   **Hybrid Masking:** For complex data structures, explore options where only specific sensitive fields are masked, while bulk non-sensitive data is transferred as plaintext. This would require more complex data handling and (de)serialization.
+    *   Investigate direct registration of client-provided device memory with libraries like ONNX Runtime within the shared enclave to potentially avoid the DtoD copy for ONNX DMA, if ORT APIs and Gramine's memory mapping capabilities permit safe and efficient implementation.
+    *   Explore DMA for output data from the shared enclave back to the client's pinned memory.
 
 6. Raw Data (Placeholder)
 =========================

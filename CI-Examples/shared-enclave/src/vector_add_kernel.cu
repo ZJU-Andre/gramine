@@ -9,23 +9,37 @@ __global__ void vectorAddKernel(float *a, const float *b, const float *c, int n)
     }
 }
 
+#include <stdbool.h> // For bool type
+#include <stdint.h>  // For uint64_t
+
 // C-callable wrapper function to launch the CUDA kernel
 extern "C" int launch_vector_add_cuda(
     float* h_A_out, 
-    const float* h_B_in, 
-    const float* h_C_in, 
+    const float* h_B_in, // Host pointer, used if not DMA for B
+    const float* h_C_in, // Host pointer, used if not DMA for C
     int n,
     int* cuda_error_code,       // Output CUDA error code
-    const char** cuda_error_str   // Output CUDA error string pointer
+    const char** cuda_error_str,  // Output CUDA error string pointer
+    bool use_dma_for_b,
+    uint64_t d_ptr_b_client,
+    bool use_dma_for_c,
+    uint64_t d_ptr_c_client
 ) {
-    float *d_A = NULL, *d_B = NULL, *d_C = NULL;
+    float *d_A = NULL; // Device pointer for result A (always allocated by enclave)
+    float *d_B_enclave = NULL; // Device pointer for B if allocated by enclave
+    float *d_C_enclave = NULL; // Device pointer for C if allocated by enclave
+
+    // Effective device pointers to be used by the kernel
+    float *d_B_effective = NULL;
+    float *d_C_effective = NULL;
+
     cudaError_t err = cudaSuccess;
 
     // Initialize output error pointers
     if (cuda_error_code) *cuda_error_code = cudaSuccess;
     if (cuda_error_str) *cuda_error_str = cudaGetErrorString(cudaSuccess);
 
-    // Allocate memory on the GPU
+    // Allocate memory for result array d_A on the GPU (always done by enclave)
     err = cudaMalloc((void**)&d_A, n * sizeof(float));
     if (err != cudaSuccess) {
         if (cuda_error_code) *cuda_error_code = err;
@@ -34,45 +48,58 @@ extern "C" int launch_vector_add_cuda(
         goto Error;
     }
 
-    err = cudaMalloc((void**)&d_B, n * sizeof(float));
-    if (err != cudaSuccess) {
-        if (cuda_error_code) *cuda_error_code = err;
-        if (cuda_error_str) *cuda_error_str = cudaGetErrorString(err);
-        fprintf(stderr, "CUDA_WRAPPER: Failed to allocate d_B: %s\n", cudaGetErrorString(err));
-        goto Error;
+    // Handle input array B
+    if (use_dma_for_b) {
+        printf("CUDA_WRAPPER: Using client-provided device pointer for B (0x%lx)\n", d_ptr_b_client);
+        d_B_effective = (float*)d_ptr_b_client; // Cast client's device pointer
+    } else {
+        printf("CUDA_WRAPPER: Allocating and copying data for B from host pointer h_B_in.\n");
+        err = cudaMalloc((void**)&d_B_enclave, n * sizeof(float));
+        if (err != cudaSuccess) {
+            if (cuda_error_code) *cuda_error_code = err;
+            if (cuda_error_str) *cuda_error_str = cudaGetErrorString(err);
+            fprintf(stderr, "CUDA_WRAPPER: Failed to allocate d_B_enclave: %s\n", cudaGetErrorString(err));
+            goto Error;
+        }
+        err = cudaMemcpy(d_B_enclave, h_B_in, n * sizeof(float), cudaMemcpyHostToDevice);
+        if (err != cudaSuccess) {
+            if (cuda_error_code) *cuda_error_code = err;
+            if (cuda_error_str) *cuda_error_str = cudaGetErrorString(err);
+            fprintf(stderr, "CUDA_WRAPPER: Failed to copy h_B_in to d_B_enclave: %s\n", cudaGetErrorString(err));
+            goto Error;
+        }
+        d_B_effective = d_B_enclave;
     }
 
-    err = cudaMalloc((void**)&d_C, n * sizeof(float));
-    if (err != cudaSuccess) {
-        if (cuda_error_code) *cuda_error_code = err;
-        if (cuda_error_str) *cuda_error_str = cudaGetErrorString(err);
-        fprintf(stderr, "CUDA_WRAPPER: Failed to allocate d_C: %s\n", cudaGetErrorString(err));
-        goto Error;
-    }
-
-    // Copy input arrays from host to device
-    err = cudaMemcpy(d_B, h_B_in, n * sizeof(float), cudaMemcpyHostToDevice);
-    if (err != cudaSuccess) {
-        if (cuda_error_code) *cuda_error_code = err;
-        if (cuda_error_str) *cuda_error_str = cudaGetErrorString(err);
-        fprintf(stderr, "CUDA_WRAPPER: Failed to copy h_B_in to d_B: %s\n", cudaGetErrorString(err));
-        goto Error;
-    }
-
-    err = cudaMemcpy(d_C, h_C_in, n * sizeof(float), cudaMemcpyHostToDevice);
-    if (err != cudaSuccess) {
-        if (cuda_error_code) *cuda_error_code = err;
-        if (cuda_error_str) *cuda_error_str = cudaGetErrorString(err);
-        fprintf(stderr, "CUDA_WRAPPER: Failed to copy h_C_in to d_C: %s\n", cudaGetErrorString(err));
-        goto Error;
+    // Handle input array C
+    if (use_dma_for_c) {
+        printf("CUDA_WRAPPER: Using client-provided device pointer for C (0x%lx)\n", d_ptr_c_client);
+        d_C_effective = (float*)d_ptr_c_client; // Cast client's device pointer
+    } else {
+        printf("CUDA_WRAPPER: Allocating and copying data for C from host pointer h_C_in.\n");
+        err = cudaMalloc((void**)&d_C_enclave, n * sizeof(float));
+        if (err != cudaSuccess) {
+            if (cuda_error_code) *cuda_error_code = err;
+            if (cuda_error_str) *cuda_error_str = cudaGetErrorString(err);
+            fprintf(stderr, "CUDA_WRAPPER: Failed to allocate d_C_enclave: %s\n", cudaGetErrorString(err));
+            goto Error;
+        }
+        err = cudaMemcpy(d_C_enclave, h_C_in, n * sizeof(float), cudaMemcpyHostToDevice);
+        if (err != cudaSuccess) {
+            if (cuda_error_code) *cuda_error_code = err;
+            if (cuda_error_str) *cuda_error_str = cudaGetErrorString(err);
+            fprintf(stderr, "CUDA_WRAPPER: Failed to copy h_C_in to d_C_enclave: %s\n", cudaGetErrorString(err));
+            goto Error;
+        }
+        d_C_effective = d_C_enclave;
     }
 
     // Define block and grid sizes
     int blockSize = 256;
     int gridSize = (n + blockSize - 1) / blockSize;
 
-    // Launch the kernel
-    vectorAddKernel<<<gridSize, blockSize>>>(d_A, d_B, d_C, n);
+    // Launch the kernel with effective pointers
+    vectorAddKernel<<<gridSize, blockSize>>>(d_A, d_B_effective, d_C_effective, n);
     err = cudaGetLastError(); // Check for errors from kernel launch
     if (err != cudaSuccess) {
         if (cuda_error_code) *cuda_error_code = err;
@@ -102,9 +129,17 @@ extern "C" int launch_vector_add_cuda(
 
     // Free GPU memory
 Error: // Common cleanup point
-    if (d_A) cudaFree(d_A);
-    if (d_B) cudaFree(d_B);
-    if (d_C) cudaFree(d_C);
+    if (d_A) cudaFree(d_A); // d_A is always allocated by enclave
+    
+    // Free d_B_enclave and d_C_enclave only if they were allocated by this function
+    if (d_B_enclave) {
+        printf("CUDA_WRAPPER: Freeing enclave-allocated d_B_enclave.\n");
+        cudaFree(d_B_enclave);
+    }
+    if (d_C_enclave) {
+        printf("CUDA_WRAPPER: Freeing enclave-allocated d_C_enclave.\n");
+        cudaFree(d_C_enclave);
+    }
 
     if (err != cudaSuccess) {
         // If an error occurred before this point, cuda_error_code and cuda_error_str are already set.

@@ -4,6 +4,7 @@
 #include <time.h>    // For srand
 #include <assert.h>
 #include <math.h>    // For fabs
+#include <cuda_runtime.h> // For CUDA host memory allocation
 
 // Gramine includes - assumed to be in include path
 #include "libos_ipc.h"
@@ -11,6 +12,16 @@
 
 // Shared header with service
 #include "shared_service.h" // From CI-Examples/common/
+
+// CUDA error checking macro
+#define CUDA_CHECK(call) \
+    do { \
+        cudaError_t err = call; \
+        if (err != cudaSuccess) { \
+            fprintf(stderr, "CUDA_ERROR at %s:%d - %s\n", __FILE__, __LINE__, cudaGetErrorString(err)); \
+            return EXIT_FAILURE; \
+        } \
+    } while (0)
 
 // Helper to print byte arrays for debugging
 static void print_float_array(const char* label, const float* data, size_t num_elements) {
@@ -67,10 +78,39 @@ int main(int argc, char *argv[]) {
 
     // 1. Initialize input data
     const int num_elements = VECTOR_ARRAY_DEFAULT_ELEMENTS;
-    float h_B[num_elements];
-    float h_C[num_elements];
-    float h_A_expected[num_elements];
+    size_t data_size_bytes = num_elements * sizeof(float);
+
+    float *h_B = NULL;
+    float *h_C = NULL;
+    // h_A_expected and h_A_result can remain stack/heap allocated as they are for client-side verification
+    float h_A_expected[num_elements]; 
     float h_A_result[num_elements];
+
+    uint64_t d_ptr_B = 0;
+    uint64_t d_ptr_C = 0;
+
+    if (current_masking_level == MASKING_NONE) {
+        printf("CLIENT_APP_LOG: Allocating page-locked (pinned) host memory for B and C using cudaHostAlloc...\n");
+        CUDA_CHECK(cudaHostAlloc((void**)&h_B, data_size_bytes, cudaHostAllocDefault));
+        CUDA_CHECK(cudaHostAlloc((void**)&h_C, data_size_bytes, cudaHostAllocDefault));
+
+        printf("CLIENT_APP_LOG: Getting device pointers for h_B and h_C...\n");
+        CUDA_CHECK(cudaHostGetDevicePointer((void**)&d_ptr_B, (void*)h_B, 0));
+        CUDA_CHECK(cudaHostGetDevicePointer((void**)&d_ptr_C, (void*)h_C, 0));
+        printf("CLIENT_APP_LOG: Device pointer for h_B: 0x%lx\n", d_ptr_B);
+        printf("CLIENT_APP_LOG: Device pointer for h_C: 0x%lx\n", d_ptr_C);
+
+    } else { // MASKING_AES_GCM
+        // Using standard malloc for non-DMA path as per instruction
+        h_B = (float*)malloc(data_size_bytes);
+        h_C = (float*)malloc(data_size_bytes);
+        if (!h_B || !h_C) {
+            fprintf(stderr, "CLIENT_APP_ERROR: Failed to allocate memory for h_B or h_C.\n");
+            if(h_B) free(h_B);
+            if(h_C) free(h_C);
+            return EXIT_FAILURE;
+        }
+    }
 
     generate_float_array(h_B, num_elements);
     generate_float_array(h_C, num_elements);
@@ -85,15 +125,16 @@ int main(int argc, char *argv[]) {
 
     // 2. Prepare request payload
     vector_add_request_payload_t request_payload;
-    memset(&request_payload, 0, sizeof(request_payload));
+    memset(&request_payload, 0, sizeof(request_payload)); // Important to zero out, especially for DMA pointers
     request_payload.array_len_elements = num_elements;
     request_payload.masking_level = current_masking_level;
     int ret;
 
-    size_t data_size_bytes = num_elements * sizeof(float);
 
     if (current_masking_level == MASKING_AES_GCM) {
         printf("CLIENT_APP_LOG: Encrypting input arrays B and C using AES-GCM...\n");
+        request_payload.src_device_ptr_b = 0; // Not using DMA
+        request_payload.src_device_ptr_c = 0; // Not using DMA
         generate_iv(request_payload.iv_b, GCM_IV_SIZE_BYTES);
         ret = libos_aes_gcm_encrypt(aes_key, request_payload.iv_b,
                                     (const unsigned char*)h_B, data_size_bytes,
@@ -109,7 +150,13 @@ int main(int argc, char *argv[]) {
         printf("CLIENT_APP_LOG: Preparing input arrays B and C as plaintext...\n");
         memcpy(request_payload.data_b, h_B, data_size_bytes);
         memcpy(request_payload.data_c, h_C, data_size_bytes);
-        // IV and Tag fields are left zeroed/uninitialized as they are not used.
+        // IV and Tag fields are left zeroed/uninitialized as they are not used for data arrays.
+        // src_device_ptr_b and src_device_ptr_c are explicitly set.
+        request_payload.src_device_ptr_b = d_ptr_B;
+        request_payload.src_device_ptr_c = d_ptr_C;
+        printf("CLIENT_APP_LOG: Using DMA path. Device pointers set in request.\n");
+        // data_b and data_c fields in payload are not used by service if device_ptrs are set.
+        // No need to zero them explicitly here if memset covered the whole struct earlier.
     }
 
     // 3. Prepare IPC message
@@ -230,6 +277,18 @@ int main(int argc, char *argv[]) {
 
     // 7. Cleanup
     free(response_msg_ptr); // ipc_send_msg_and_get_response allocates this
+
+    if (current_masking_level == MASKING_NONE) {
+        printf("CLIENT_APP_LOG: Freeing page-locked (pinned) host memory for B and C using cudaFreeHost...\n");
+        if (h_B) CUDA_CHECK(cudaFreeHost(h_B));
+        if (h_C) CUDA_CHECK(cudaFreeHost(h_C));
+    } else { // MASKING_AES_GCM
+        if (h_B) free(h_B);
+        if (h_C) free(h_C);
+    }
+    h_B = NULL; // Avoid double free if error occurred before full success
+    h_C = NULL;
+
     printf("CLIENT_APP_LOG: Client application finished successfully.\n");
 
     return EXIT_SUCCESS;

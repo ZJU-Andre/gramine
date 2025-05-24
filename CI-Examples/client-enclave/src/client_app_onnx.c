@@ -4,6 +4,7 @@
 #include <time.h>    // For srand, clock
 #include <assert.h>
 #include <math.h>    // For fabs
+#include <cuda_runtime.h> // For CUDA host memory allocation
 
 // Gramine includes
 #include "libos_ipc.h"
@@ -11,6 +12,18 @@
 
 // Shared header with service
 #include "shared_service.h" // From CI-Examples/common/
+
+// CUDA error checking macro
+#define CUDA_CHECK(call) \
+    do { \
+        cudaError_t err = call; \
+        if (err != cudaSuccess) { \
+            fprintf(stderr, "CUDA_ERROR at %s:%d - %s\n", __FILE__, __LINE__, cudaGetErrorString(err)); \
+            /* For client_app_onnx, we might want to free allocated resources before exiting */ \
+            /* This macro is simplified; more complex cleanup might be needed depending on where it's called */ \
+            exit(EXIT_FAILURE); \
+        } \
+    } while (0)
 
 // ONNX MobileNetV2 specific dimensions
 #define ONNX_MODEL_INPUT_CHANNELS 3
@@ -102,18 +115,31 @@ int main(int argc, char *argv[]) {
     const uint32_t input_tensor_size_bytes = input_elements * sizeof(float);
     assert(input_tensor_size_bytes <= MAX_ONNX_INPUT_SIZE_BYTES);
 
-    float* input_tensor_plaintext = (float*)malloc(input_tensor_size_bytes);
-    if (!input_tensor_plaintext) {
-        fprintf(stderr, "CLIENT_APP_ONNX_ERROR: Failed to allocate memory for input tensor.\n");
-        return EXIT_FAILURE;
+    float* input_tensor_plaintext = NULL;
+    uint64_t d_ptr_input_tensor = 0;
+
+    if (current_masking_level == MASKING_NONE) {
+        printf("CLIENT_APP_ONNX_LOG: Allocating page-locked (pinned) host memory for input_tensor_plaintext using cudaHostAlloc...\n");
+        CUDA_CHECK(cudaHostAlloc((void**)&input_tensor_plaintext, input_tensor_size_bytes, cudaHostAllocDefault));
+        
+        printf("CLIENT_APP_ONNX_LOG: Getting device pointer for input_tensor_plaintext...\n");
+        CUDA_CHECK(cudaHostGetDevicePointer((void**)&d_ptr_input_tensor, (void*)input_tensor_plaintext, 0));
+        printf("CLIENT_APP_ONNX_LOG: Device pointer for input_tensor_plaintext: 0x%lx\n", d_ptr_input_tensor);
+    } else { // MASKING_AES_GCM
+        input_tensor_plaintext = (float*)malloc(input_tensor_size_bytes);
+        if (!input_tensor_plaintext) {
+            fprintf(stderr, "CLIENT_APP_ONNX_ERROR: Failed to allocate memory for input tensor.\n");
+            return EXIT_FAILURE;
+        }
     }
+
     generate_random_float_tensor(input_tensor_plaintext, input_elements);
     printf("CLIENT_APP_ONNX_LOG: Generated dummy input tensor of size %u bytes (%u elements).\n",
            input_tensor_size_bytes, input_elements);
 
     // 2. Prepare request payload
     onnx_inference_request_payload_t request_payload;
-    memset(&request_payload, 0, sizeof(request_payload));
+    memset(&request_payload, 0, sizeof(request_payload)); // Important to zero out, especially for DMA pointers
     request_payload.input_tensor_size_bytes = input_tensor_size_bytes;
     // Optional: Populate model_name if service uses it (not used in this example's service)
     // strncpy(request_payload.model_name, "mobilenetv2-7.onnx", MAX_MODEL_NAME_LEN -1);
@@ -123,6 +149,7 @@ int main(int argc, char *argv[]) {
 
     if (current_masking_level == MASKING_AES_GCM) {
         printf("CLIENT_APP_ONNX_LOG: Encrypting input tensor using AES-GCM...\n");
+        request_payload.src_device_ptr_input_tensor = 0; // Not using DMA
         generate_iv(request_payload.iv, GCM_IV_SIZE_BYTES);
         ret = libos_aes_gcm_encrypt(aes_key, request_payload.iv,
                                         (const unsigned char*)input_tensor_plaintext,
@@ -132,14 +159,19 @@ int main(int argc, char *argv[]) {
                                         NULL, 0); 
         if (ret != 0) {
             fprintf(stderr, "CLIENT_APP_ONNX_ERROR: Encryption of input tensor failed: %d\n", ret);
-            free(input_tensor_plaintext);
-            return EXIT_FAILURE;
+            // free(input_tensor_plaintext) will be handled in cleanup section
+            return EXIT_FAILURE; // Consider more robust cleanup if other resources were allocated
         }
     } else { // MASKING_NONE
-        printf("CLIENT_APP_ONNX_LOG: Preparing input tensor as plaintext...\n");
-        memcpy(request_payload.input_tensor, input_tensor_plaintext, input_tensor_size_bytes);
+        printf("CLIENT_APP_ONNX_LOG: Preparing input tensor for DMA path...\n");
+        // For DMA, data is not copied into request_payload.input_tensor.
+        // The service will use src_device_ptr_input_tensor to access it directly.
+        request_payload.src_device_ptr_input_tensor = d_ptr_input_tensor;
+        printf("CLIENT_APP_ONNX_LOG: Using DMA path. Device pointer set in request.\n");
+        // request_payload.input_tensor field is not used by service if device_ptr is set.
     }
-    free(input_tensor_plaintext); 
+    // NOTE: The free(input_tensor_plaintext) that was here is moved to the main cleanup section
+    // because for DMA, the buffer must remain valid until the service is done.
 
     // 3. Prepare IPC message
     struct libos_ipc_msg request_msg;
@@ -245,8 +277,25 @@ int main(int argc, char *argv[]) {
     }
     
     // 7. Cleanup
-    free(output_tensor_plaintext);
-    free(response_msg_ptr); 
+    if (input_tensor_plaintext) {
+        if (current_masking_level == MASKING_NONE) {
+            printf("CLIENT_APP_ONNX_LOG: Freeing page-locked (pinned) host memory for input_tensor_plaintext using cudaFreeHost...\n");
+            CUDA_CHECK(cudaFreeHost(input_tensor_plaintext));
+        } else { // MASKING_AES_GCM
+            printf("CLIENT_APP_ONNX_LOG: Freeing host memory for input_tensor_plaintext using free()...\n");
+            free(input_tensor_plaintext);
+        }
+        input_tensor_plaintext = NULL;
+    }
+
+    if (output_tensor_plaintext) {
+        free(output_tensor_plaintext);
+        output_tensor_plaintext = NULL;
+    }
+    if (response_msg_ptr) {
+        free(response_msg_ptr); 
+        response_msg_ptr = NULL;
+    }
     printf("CLIENT_APP_ONNX_LOG: ONNX client application finished successfully.\n");
 
     return EXIT_SUCCESS;
