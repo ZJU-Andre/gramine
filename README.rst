@@ -61,6 +61,8 @@ important pages:
   <https://gramine.readthedocs.io/en/latest/performance.html>`__
 - `Remote attestation in Gramine
   <https://gramine.readthedocs.io/en/latest/attestation.html>`__
+- `Shared Enclave GPU Architecture
+  <https://gramine.readthedocs.io/en/latest/features/shared-enclave-gpu.html>`__
 
 
 Users of Gramine

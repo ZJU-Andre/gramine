@@ -1,0 +1,63 @@
+loader.log_level = "debug" # Changed to debug for more verbose output during testing
+libos.entrypoint = "/gramine/CI-Examples/shared-enclave/bin/shared_service"
+
+sys.stack.size = "2M" # Keep as is, can be tuned
+# Add LD_LIBRARY_PATH to help find CUDA libs if not in standard system paths or rpath isn't enough
+# This path should correspond to where CUDA libraries are mounted/accessible inside Gramine.
+# If using system libraries directly via trusted_files, this might be less critical for those,
+# but useful if libraries are bundled differently.
+# For this example, we'll rely on trusted_files and system linker paths primarily.
+# loader.env.LD_LIBRARY_PATH = "/usr/local/cuda/lib64:/lib:/usr/lib"
+
+sgx.enclave_size = "1G" # Keep as is, adjust based on application needs
+sgx.max_threads = 32   # Increased for potential parallelism in service/CUDA callbacks
+
+# Ensure device access for NVIDIA GPU
+sgx.allowed_files = [
+  "dev:/dev/nvidia0",
+  "dev:/dev/nvidiactl",
+  "dev:/dev/nvidia-uvm",
+  "dev:/dev/nvidia-modeset", # Sometimes needed
+  # Add other devices if required by specific CUDA versions or setups
+]
+
+fs.mounts = [
+  { path = "/untrusted_region", type = "untrusted_shm", uri = "file:/gramine/untrusted_shm/shared_region" },
+  # Mount for CUDA libraries - this allows specifying paths inside the enclave
+  # that map to host paths where CUDA libs are. This is an alternative/complement to
+  # listing every single library in trusted_files if they are in a directory.
+  # However, for SGX, each file that needs to be measured must be explicitly listed
+  # or be part of a trusted directory mount (which has its own complexities).
+  # For simplicity and explicitness with SGX, listing individual trusted files is often clearer.
+  # Example: { path = "/usr/local/cuda-libs", uri = "file:/usr/local/cuda/lib64" } # if libs are there
+]
+
+sgx.trusted_files = [
+  "file:/gramine/CI-Examples/shared-enclave/bin/shared_service", # Adjusted path
+
+  # IMPORTANT: The following paths are placeholders.
+  # Users MUST adapt these paths to their system's actual CUDA installation directory
+  # or to the location where they have staged these libraries for Gramine to access.
+  # Gramine needs to find these files on the host at the specified `file:` URI
+  # to measure and load them into the enclave.
+  # Common locations might be /usr/lib/x86_64-linux-gnu/, /usr/local/cuda/lib64/,
+  # or a custom path if using a specific CUDA toolkit version.
+  # Check `ldd` on a native CUDA application to see its dependencies.
+
+  "file:/usr/lib/host_cuda_libs/libcudart.so.11.0",   # Example for CUDA 11.x
+  "file:/usr/lib/host_cuda_libs/libcuda.so.1",        # Core CUDA driver library
+  "file:/usr/lib/host_cuda_libs/libnvptxcompiler.so.1", # PTX compiler, often needed
+  "file:/usr/lib/host_cuda_libs/libnvidia-fatbinaryloader.so.VERSION", # Replace VERSION with actual, e.g., 495.29.05
+  # Add other libraries like libcupti, libcublas, libnvrtc, etc., if your application uses them.
+  # Also, ensure any dependent libraries of these are also trusted (e.g., libstdc++.so, libgcc_s.so if not using musl).
+  # Standard C libraries and pthreads are typically provided by Gramine or must also be trusted if from host.
+  "file:/lib/x86_64-linux-gnu/libpthread.so.0", # Example, if not using Gramine's built-in
+  "file:/lib/x86_64-linux-gnu/libdl.so.2",
+  "file:/lib/x86_64-linux-gnu/librt.so.1",
+  # Ensure correct C++ std library if CUDA libs depend on it and it's not part of base Gramine image.
+  # "file:/usr/lib/x86_64-linux-gnu/libstdc++.so.6",
+]
+
+# Optional: Environment variables for CUDA, if needed
+# loader.env.CUDA_VISIBLE_DEVICES = "0"
+# loader.env.LD_LIBRARY_PATH = "/usr/local/cuda-libs" # if using the mount above
