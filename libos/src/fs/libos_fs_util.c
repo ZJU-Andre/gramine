@@ -140,10 +140,32 @@ int generic_emulated_mmap(struct libos_handle* hdl, void* addr, size_t size, int
                           uint64_t offset, size_t* out_valid_size) {
     assert(addr && IS_ALLOC_ALIGNED_PTR(addr));
     assert(IS_ALLOC_ALIGNED(size));
+    assert(hdl && hdl->pal_handle); // Ensure pal_handle is valid
 
     int ret;
-
     pal_prot_flags_t pal_prot = LINUX_PROT_TO_PAL(prot, flags);
+
+    // Check if the underlying PAL handle is a device
+    if (hdl->pal_handle->hdr.type == PAL_TYPE_DEV) {
+        log_debug("MMAP: Detected PAL_TYPE_DEV for fd %d, attempting PalDeviceMap addr %p size %zu off %lx prot %x",
+                  hdl->fd, addr, size, offset, pal_prot);
+        // For devices, directly call PalDeviceMap
+        // Ensure that MAP_SHARED is passed if appropriate, as PalDeviceMap typically implies shared.
+        // flags & MAP_SHARED is already incorporated into pal_prot by LINUX_PROT_TO_PAL
+        ret = PalDeviceMap(hdl->pal_handle, addr, pal_prot, offset, size);
+        if (ret < 0) {
+            log_error("MMAP: PalDeviceMap failed for fd %d: %s", hdl->fd, pal_strerror(ret));
+            return pal_to_unix_errno(ret);
+        }
+        // For device mappings, the entire requested size is considered valid if successful.
+        // The PAL layer (and host OS) handles errors for invalid offset/size for a device.
+        *out_valid_size = size;
+        log_debug("MMAP: PalDeviceMap succeeded for fd %d, addr %p, size %zu", hdl->fd, addr, size);
+        return 0;
+    }
+
+    // Original logic for regular files (emulated mmap)
+    log_debug("MMAP: Not a device (type %d), proceeding with emulated mmap for fd %d", hdl->pal_handle->hdr.type, hdl->fd);
     pal_prot_flags_t pal_prot_writable = pal_prot | PAL_PROT_WRITE;
 
     ret = PalVirtualMemoryAlloc(addr, size, pal_prot_writable);
@@ -154,15 +176,17 @@ int generic_emulated_mmap(struct libos_handle* hdl, void* addr, size_t size, int
     char* read_addr = addr;
     file_off_t pos = offset;
     while (size_to_read > 0) {
+        // For emulated mmap, we must use the fs_ops->read, not PalStreamRead directly,
+        // as it might involve decryption or other fs-level logic.
         ssize_t count = hdl->fs->fs_ops->read(hdl, read_addr, size_to_read, &pos);
         if (count < 0) {
             if (count == -EINTR)
                 continue;
             ret = count;
-            goto err;
+            goto err_emulated;
         }
 
-        if (count == 0)
+        if (count == 0) // EOF
             break;
 
         assert((size_t)count <= size_to_read);
@@ -174,33 +198,32 @@ int generic_emulated_mmap(struct libos_handle* hdl, void* addr, size_t size, int
         ret = PalVirtualMemoryProtect(addr, size, pal_prot);
         if (ret < 0) {
             ret = pal_to_unix_errno(ret);
-            goto err;
+            goto err_emulated;
         }
     }
 
-    /*
-     * Underlying file may be shorter than the requested mmap size. In this case access beyond the
-     * last file-backed page must cause SIGBUS. Since we allocated all memory above, let's make the
-     * chunk of memory that is beyond the last file-backed page unavailable. Also see checkpointing
-     * logic in libos_vma.c for similar emulation in the child process.
-     */
     assert(size_to_read <= size);
     size_t valid_size = ALLOC_ALIGN_UP(size - size_to_read);
     if (valid_size < size) {
-        int valid_ret = PalVirtualMemoryProtect(addr + valid_size, size - valid_size,
-                                                /*prot=*/0);
-        if (valid_ret < 0)
-            BUG();
+        // Protect pages that are beyond the end of the file
+        int valid_ret = PalVirtualMemoryProtect(addr + valid_size, size - valid_size, PROT_NONE);
+        if (valid_ret < 0) {
+            log_error("MMAP: PalVirtualMemoryProtect for post-EOF region failed: %s", pal_strerror(valid_ret));
+            // This is not necessarily a fatal error for the mapping itself, but indicates an issue.
+            // Depending on strictness, could BUG() or just log. For now, log and continue.
+        }
     }
 
     *out_valid_size = valid_size;
+    log_debug("MMAP: Emulated mmap succeeded for fd %d, addr %p, valid_size %zu", hdl->fd, addr, valid_size);
     return 0;
 
-err:;
+err_emulated:;
     int free_ret = PalVirtualMemoryFree(addr, size);
     if (free_ret < 0) {
-        log_debug("PalVirtualMemoryFree failed on cleanup: %s", pal_strerror(free_ret));
-        BUG();
+        log_debug("MMAP: PalVirtualMemoryFree failed on cleanup for emulated mmap (fd %d): %s", hdl->fd, pal_strerror(free_ret));
+        // This is a serious issue, as we might leak memory or leave a VMA in an inconsistent state.
+        BUG(); // Consider what to do in a production system if this happens.
     }
     return ret;
 }

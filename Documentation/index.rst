@@ -229,6 +229,8 @@ Indices and tables
 
    devel/features
    devel/encfiles
+   features/shared-enclave-gpu
+   performance/gpu_shared_enclave_analysis
    management-team
    gramine-users
    sgx-intro

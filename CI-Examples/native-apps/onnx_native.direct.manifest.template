@@ -1,0 +1,36 @@
+loader.log_level = "debug"
+libos.entrypoint = "/benchmark_apps/onnx_native_benchmark"
+
+fs.mounts = [
+  { path = "/benchmark_apps", uri = "file:./bin" },
+  { path = "/models", uri = "file:./models" }, # Assuming models are in ./models relative to native-apps dir
+  # Mount CUDA libraries if needed and not found by rpath/LD_LIBRARY_PATH
+  # { path = "/usr/local/cuda", uri = "file:/usr/local/cuda" },
+  # Mount ONNX Runtime libraries if needed
+  # { path = "/usr/local/onnxruntime", uri = "file:/usr/local/onnxruntime" },
+]
+
+sgx.enclave_size = "1G" # Adjust as needed for ONNX model and runtime
+
+loader.allowed_files = [
+  "dev:/dev/nvidia0",
+  "dev:/dev/nvidiactl",
+  "dev:/dev/nvidia-uvm",
+  "dev:/dev/nvidia-modeset",
+]
+
+# For direct mode, trusted_files are less about measurement and more about ensuring Gramine can find them
+# if they are not part of the system paths Gramine inherently trusts/passes through.
+# Often, for direct mode, minimal trusted_files are needed if the system environment is well-configured.
+sgx.trusted_files = [
+  "file:/benchmark_apps/onnx_native_benchmark",
+  "file:/models/mobilenetv2-7.onnx", # Ensure the model is "trusted" if accessed via this path
+  # System libraries (examples, highly system-dependent)
+  "file:/usr/lib/x86_64-linux-gnu/libcudart.so.11.0",
+  "file:/usr/lib/x86_64-linux-gnu/libcuda.so.1",
+  "file:/usr/lib/x86_64-linux-gnu/libonnxruntime.so.1.15.1", # Adjust version
+  # Add other dependencies shown by 'ldd onnx_native_benchmark' and 'ldd libonnxruntime.so'
+]
+
+# loader.env.LD_LIBRARY_PATH = "/usr/local/cuda/lib64:/usr/local/onnxruntime/lib"
+# loader.env.CUDA_VISIBLE_DEVICES = "0"

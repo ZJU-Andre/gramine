@@ -1,0 +1,33 @@
+loader.log_level = "debug"
+libos.entrypoint = "/benchmark_apps/vector_add_native_benchmark" # Path inside Gramine
+
+# Mount the directory containing the native app
+fs.mounts = [
+  { path = "/benchmark_apps", uri = "file:./bin" }, # Mounts the ./bin dir (where executable is) to /benchmark_apps
+  # Potentially mount CUDA libraries if not in system paths Gramine checks by default
+  # { path = "/usr/local/cuda", uri = "file:/usr/local/cuda" },
+]
+
+sgx.enclave_size = "512M" # Generic, can be adjusted
+
+# Allow access to GPU devices
+loader.allowed_files = [
+  "dev:/dev/nvidia0",
+  "dev:/dev/nvidiactl",
+  "dev:/dev/nvidia-uvm",
+  "dev:/dev/nvidia-modeset",
+]
+
+# Trusted files for direct mode often include the app and essential libs it might load,
+# though for direct mode, it's less about SGX measurement and more about Gramine's environment.
+# For simplicity, we'll list the app. Gramine Direct will use host libs mostly.
+sgx.trusted_files = [
+  "file:/benchmark_apps/vector_add_native_benchmark",
+  # Add system CUDA libraries if they are not found automatically by the app's rpath
+  # These are examples and highly system-dependent.
+  "file:/usr/lib/x86_64-linux-gnu/libcudart.so.11.0", # Example
+  "file:/usr/lib/x86_64-linux-gnu/libcuda.so.1",      # Example
+]
+
+# Environment variables (if needed, e.g., for CUDA lib paths if not using rpath in binary)
+# loader.env.LD_LIBRARY_PATH = "/usr/local/cuda/lib64"
