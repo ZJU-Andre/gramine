@@ -1,0 +1,60 @@
+loader.log_level = "debug" 
+libos.entrypoint = "/gramine/CI-Examples/shared-enclave/bin/shared_service"
+
+sys.stack.size = "2M" 
+sgx.enclave_size = "1G" # Consider increasing if large models/GEMM operations require more memory
+sgx.max_threads = 32   
+
+sgx.allowed_files = [
+  "dev:/dev/nvidia0",
+  "dev:/dev/nvidiactl",
+  "dev:/dev/nvidia-uvm",
+  "dev:/dev/nvidia-modeset", 
+]
+
+fs.mounts = [
+  { path = "/untrusted_region", type = "untrusted_shm", uri = "file:/gramine/untrusted_shm/shared_region" },
+  { path = "/models", uri = "file:./models" }, 
+]
+
+sgx.trusted_files = [
+  "file:/gramine/CI-Examples/shared-enclave/bin/shared_service", 
+  "file:./models/mobilenetv2-7.onnx",
+
+  # CUDA Core Libraries (User MUST adapt paths)
+  "file:/usr/lib/host_cuda_libs/libcuda.so.1",        # Core CUDA driver library, essential for any CUDA operation
+  "file:/usr/lib/host_cuda_libs/libcudart.so.11.0",   # CUDA Runtime, used by vector_add and potentially cuBLAS/ORT
+  "file:/usr/lib/host_cuda_libs/libnvptxcompiler.so.1", # PTX compiler, often needed by CUDA runtime/drivers
+  "file:/usr/lib/host_cuda_libs/libnvidia-fatbinaryloader.so.VERSION", # Replace VERSION
+
+  # cuBLAS Library (User MUST adapt path)
+  "file:/usr/lib/host_cuda_libs/libcublas.so.11",        # Example for CUDA 11.x cuBLAS
+  "file:/usr/lib/host_cuda_libs/libcublasLt.so.11",      # cuBLAS Lite, often a dependency
+
+  # ONNX Runtime Libraries (User MUST adapt paths)
+  "file:/usr/lib/host_onnx_libs/libonnxruntime.so.1.15.1", # Adjust version
+  "file:/usr/lib/host_onnx_libs/libonnxruntime_providers_shared.so.1.15.1", # Adjust version
+  "file:/usr/lib/host_onnx_libs/libonnxruntime_providers_cuda.so.1.15.1",   # Adjust version
+  
+  # Other CUDA libraries that ONNX Runtime's CUDA EP or cuBLAS might depend on
+  "file:/usr/lib/host_cuda_libs/libcudnn.so.8",          # Example for cuDNN 8.x (if ONNX model uses cuDNN ops)
+  # "file:/usr/lib/host_cuda_libs/libnvrtc.so.11.2", # if ORT/cuBLAS uses NVRTC
+
+  # Common System Libraries (often dependencies of CUDA/ONNX libs)
+  "file:/lib/x86_64-linux-gnu/libpthread.so.0", 
+  "file:/lib/x86_64-linux-gnu/libdl.so.2",
+  "file:/lib/x86_64-linux-gnu/librt.so.1",
+  "file:/lib/x86_64-linux-gnu/libm.so.6",      
+  "file:/usr/lib/x86_64-linux-gnu/libstdc++.so.6", 
+  "file:/lib/x86_64-linux-gnu/libgcc_s.so.1",   
+]
+
+# loader.env.LD_LIBRARY_PATH = "/usr/local/cuda-libs:/usr/local/onnx-libs:/models" 
+# loader.env.CUDA_VISIBLE_DEVICES = "0"
+# loader.env.ORT_CUDA_UNSYNC_MEMORY_COPY = "1" 
+# loader.env.ORT_LOG_LEVEL = "VERBOSE" 
+# loader.env.ORT_DISABLE_TELEMETRY = "1"
+sgx.rpc_thread_num = 8 
+sys.enable_sigterm_injection = true 
+loader.pal_internal_mem_size = "512M" 
+sgx.debug = true

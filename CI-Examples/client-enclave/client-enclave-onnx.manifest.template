@@ -1,0 +1,26 @@
+loader.log_level = "debug"
+libos.entrypoint = "/gramine/CI-Examples/client-enclave/bin/client_app_onnx"
+
+sys.stack.size = "2M" 
+sgx.enclave_size = "512M" 
+sgx.max_threads = 8    
+
+# Client enclave does not need direct access to GPU or ONNX models/libraries
+# if it uses the shared_service for all ONNX operations.
+sgx.allowed_files = [
+  # Example: "dev:/dev/sgx_prv", # if using client-side attestation or sealing features directly
+]
+
+fs.mounts = [
+  # Mount for untrusted shared memory, if client needs to use it directly for other purposes.
+  # For the ONNX inference example, data is passed via IPC, so this is not strictly required by it.
+  { path = "/untrusted_region", type = "untrusted_shm", uri = "file:/gramine/untrusted_shm/shared_region" },
+]
+
+sgx.trusted_files = [
+  "file:/gramine/CI-Examples/client-enclave/bin/client_app_onnx", # Adjusted path
+  # Standard C libraries and pthreads are typically provided by Gramine or must also be trusted if from host.
+  "file:/lib/x86_64-linux-gnu/libpthread.so.0", # Example, if not using Gramine's built-in
+  "file:/lib/x86_64-linux-gnu/libdl.so.2",
+  # "file:/usr/lib/x86_64-linux-gnu/libstdc++.so.6", # If client uses C++ features not in base
+]

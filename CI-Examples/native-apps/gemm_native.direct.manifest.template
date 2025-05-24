@@ -1,0 +1,29 @@
+loader.log_level = "debug"
+libos.entrypoint = "/benchmark_apps/gemm_native_benchmark"
+
+fs.mounts = [
+  { path = "/benchmark_apps", uri = "file:./bin" },
+  # Mount CUDA libraries if needed and not found by rpath/LD_LIBRARY_PATH
+  # { path = "/usr/local/cuda", uri = "file:/usr/local/cuda" },
+]
+
+sgx.enclave_size = "1G" # GEMM can use significant memory for large matrices
+
+loader.allowed_files = [
+  "dev:/dev/nvidia0",
+  "dev:/dev/nvidiactl",
+  "dev:/dev/nvidia-uvm",
+  "dev:/dev/nvidia-modeset",
+]
+
+sgx.trusted_files = [
+  "file:/benchmark_apps/gemm_native_benchmark",
+  # System libraries (examples, highly system-dependent)
+  "file:/usr/lib/x86_64-linux-gnu/libcudart.so.11.0",
+  "file:/usr/lib/x86_64-linux-gnu/libcuda.so.1",
+  "file:/usr/lib/x86_64-linux-gnu/libcublas.so.11",
+  # Add other dependencies shown by 'ldd gemm_native_benchmark'
+]
+
+# loader.env.LD_LIBRARY_PATH = "/usr/local/cuda/lib64"
+# loader.env.CUDA_VISIBLE_DEVICES = "0"
