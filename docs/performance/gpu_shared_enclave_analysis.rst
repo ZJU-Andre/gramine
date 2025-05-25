@@ -264,12 +264,58 @@ Security Implications of `MASKING_NONE` (DMA or IPC Copy)
 It is crucial to reiterate that `MASKING_NONE` (whether using DMA or IPC copy for plaintext) means that the GPU data payloads are transferred between enclaves as plaintext and will reside in GPU memory as plaintext. This data is vulnerable to observation by a compromised host OS/hypervisor while on the PCIe bus or in GPU device memory.
 This mode should **only** be used if the specific data being processed by the GPU is deemed non-sensitive. The decision must be a careful trade-off between performance and security.
 
-Handling Mixed-Sensitivity Workloads
-------------------------------------
-A significant advantage of the selective data handling mechanism (choosing between `MASKING_AES_GCM` and `MASKING_NONE` with DMA per request) is the ability to efficiently manage workloads with mixed data sensitivities. Applications can:
-*   Use `MASKING_AES_GCM` for processing sensitive data segments, ensuring their confidentiality and integrity.
-*   Switch to `MASKING_NONE` with DMA for non-sensitive data segments within the same application or workflow, benefiting from significantly higher performance for those parts.
-This flexibility allows developers to strike an optimal balance between security and performance, applying strong protections where necessary and leveraging performance optimizations where the data's sensitivity permits. For instance, a complex AI pipeline might process sensitive user metadata with AES-GCM, while bulk image pixel data (if deemed non-sensitive after initial processing) could be handled via the DMA path for faster GPU acceleration.
+Handling Mixed-Sensitivity Data Workloads
+-----------------------------------------
+
+The selective data handling mechanism, allowing a per-request choice between ``MASKING_AES_GCM`` and ``MASKING_NONE`` with DMA, is particularly beneficial for GPU workloads that involve components with varying data sensitivities. This flexibility enables applications to apply strong cryptographic protections where necessary while leveraging performance optimizations for less sensitive data segments.
+
+**1. Data Sensitivity Mapping & Mechanisms**
+
+The choice of mechanism is directly tied to the sensitivity of the data being processed by the GPU:
+
+*   **High Sensitivity Data:**
+    *   **Strategy:** Maximum protection for data confidentiality and integrity throughout its lifecycle outside the client enclave's direct control (during IPC, within shared enclave CPU memory, and potentially on the GPU if not end-to-end GPU crypto is available).
+    *   **Mechanism:** ``MASKING_AES_GCM``.
+    *   **Data Flow:**
+        *   *Input:* Client encrypts data with AES-GCM. Ciphertext, IV, and MAC tag are sent via IPC. The shared enclave receives, decrypts the data into its CPU memory, and then copies it to GPU device memory (Host-to-Device).
+        *   *Output:* After GPU computation, data is copied from GPU device memory to the shared enclave's CPU memory (Device-to-Host). The shared enclave encrypts this data with AES-GCM, and the resulting ciphertext, IV, and MAC tag are sent back to the client via IPC.
+    *   **Overheads:** Includes AES-GCM cryptographic operations (encryption/decryption) on both client and shared enclave sides, multiple memory copies (client host <-> client enclave <-> IPC <-> shared enclave CPU <-> shared enclave GPU), and larger IPC payloads due to ciphertext and GCM tags.
+
+*   **Medium Sensitivity Data:**
+    *   **Strategy & Challenges:** The definition of "Medium Sensitivity" can be ambiguous. If the primary concern is data exposure *on the GPU device memory or during PCIe transfer*, then any data that cannot tolerate being plaintext in these locations must be treated as High Sensitivity. The current framework offers two primary paths: full AES-GCM protection or plaintext handling optimized for DMA.
+    *   If "Medium Sensitivity" implies that data can be plaintext on the GPU and PCIe bus but requires protection during IPC transit *only*, the current ``MASKING_NONE`` with DMA path does not provide this specific intermediate protection (as DMA implies data is also plaintext on the host for the client's DMA setup). The ``MASKING_NONE`` with IPC copy path (where data is copied into the IPC payload) also transmits plaintext.
+    *   **Conclusion for this Framework:**
+        1.  If "Medium Sensitivity" data **cannot** be plaintext on the GPU/PCIe bus, it **must be treated as High Sensitivity** and use ``MASKING_AES_GCM``.
+        2.  If "Medium Sensitivity" data **can** be plaintext on the GPU/PCIe bus (and the primary concern was, for example, IPC transit if it were over an untrusted network, which is not the case for Gramine's local IPC), then for performance reasons, it would be handled like Low Sensitivity data using ``MASKING_NONE`` with DMA, accepting the associated security implications.
+
+*   **Low Sensitivity Data:**
+    *   **Strategy:** Maximum performance by minimizing memory copies and eliminating cryptographic overhead.
+    *   **Mechanism:** ``MASKING_NONE`` with client-provided DMA pointers.
+    *   **Data Flow:**
+        *   *Input:* Client allocates CUDA pinned host memory, generates/places data in it, and obtains corresponding device pointers. These device pointers (and data sizes) are sent via IPC to the shared enclave. The shared enclave uses these device pointers to instruct the GPU to directly access the data (e.g., for CUDA kernels or cuBLAS) or performs an efficient Device-to-Device (DtoD) copy if an intermediate enclave-managed device buffer is necessary (e.g., for current ONNX Runtime integration).
+        *   *Output (with DMA output extension):* Client allocates CUDA pinned host memory for results and provides its host pointer (and buffer size) via IPC. The shared enclave, after GPU computation, initiates a Device-to-Host DMA transfer directly from its GPU result buffer to the client's pinned host memory.
+    *   **Overheads:** Minimal memory copies. For inputs directly used by kernels, it approaches zero-copy from the shared enclave's perspective. For outputs via DMA, it's one DtoH copy. No cryptographic overhead. IPC payloads are small (pointers and metadata). The main overheads are SGX transitions for IPC/driver calls and client-side pinned memory management.
+    *   **Security Implication:** Data is plaintext in client's host memory (pinned buffers), on the PCIe bus during transfer, and in GPU device memory. This mode is only suitable for data where such exposure is acceptable.
+
+**2. Application-Level Strategy for Mixed Workloads**
+
+A single GPU operation request to the shared enclave (e.g., a specific ``vector_add_request_payload_t``) is associated with a single ``masking_level``. It does not support different masking levels for different data elements *within the same request*.
+
+Therefore, to process a task involving components of mixed sensitivities, the client application must:
+1.  **Decompose the Task:** Break down the overall workload into a sequence of discrete GPU operation sub-requests.
+2.  **Assign Sensitivity:** Determine the appropriate sensitivity level (High or Low, mapping Medium as discussed above) for the data involved in each sub-request.
+3.  **Prepare Data & Request:** For each sub-request:
+    *   If High Sensitivity: Encrypt data, prepare ``MASKING_AES_GCM`` request.
+    *   If Low Sensitivity: Prepare data in pinned memory, obtain relevant pointers, and prepare ``MASKING_NONE`` request with DMA pointers.
+4.  **Sequential Invocation:** Send each sub-request to the shared enclave sequentially (or manage dependencies if parallel execution is possible and meaningful for the workload). The client is responsible for assembling the final results from potentially multiple, differently processed sub-requests.
+
+**3. Overall Overhead Considerations for Mixed Workloads**
+
+The total overhead and performance for a mixed-sensitivity workload will be a sum of the overheads incurred by processing each data component according to its chosen path:
+*   **High-sensitivity components** will contribute higher latency due to cryptographic operations and multiple data copies associated with ``MASKING_AES_GCM``.
+*   **Low-sensitivity components** will benefit from significantly lower latency and higher throughput when processed using ``MASKING_NONE`` with DMA, due to the elimination of cryptographic overhead and minimization of data copies.
+
+By strategically decomposing tasks and applying the appropriate data handling mechanism, applications can achieve a balance: ensuring strong security for sensitive parts of their data while maximizing performance for non-sensitive, bulk data operations on the GPU. The effectiveness of this approach depends on the granularity at which the application can separate its data and operations by sensitivity.
 
 5. Conclusions and Recommendations (Hypothetical)
 =================================================
@@ -285,8 +331,31 @@ This flexibility allows developers to strike an optimal balance between security
     *   Leverage the per-request masking choice to efficiently process mixed-sensitivity workloads.
 *   **Potential Future Optimization Areas:**
     *   (Existing points remain relevant)
-    *   Investigate direct registration of client-provided device memory with libraries like ONNX Runtime within the shared enclave to potentially avoid the DtoD copy for ONNX DMA, if ORT APIs and Gramine's memory mapping capabilities permit safe and efficient implementation.
-    *   Explore DMA for output data from the shared enclave back to the client's pinned memory.
+    *   **ONNX Runtime Direct Device Memory Registration:** Investigate enabling ONNX Runtime (ORT) within the shared enclave to directly use client-provided device memory for input and output tensors, aiming to eliminate Device-to-Device (DtoD) memory copies currently used in the ONNX DMA path. This approach would leverage ORT C APIs such as `CreateTensorWithDataAsOrtValue`, where the `OrtMemoryInfo` parameter can specify that the provided data pointer is resident on a CUDA device.
+        *   **Feasibility & Implementation Sketch:**
+            1.  **Client-Side:** The client application allocates CUDA device memory for input/output tensors.
+            2.  **Memory Sharing with Enclave:** The client provides device pointers (or safer handles like CUDA IPC handles if crossing process boundaries) and tensor metadata (shape, data type, device ID) to the shared enclave.
+            3.  **Validation in Enclave:** Within the shared enclave, these pointers/handles must be rigorously validated. This includes verifying they point to accessible and valid device memory regions of the expected size, potentially by interacting with the CUDA driver APIs from within the enclave.
+            4.  **ORT Tensor Creation:** The shared enclave uses `CreateTensorWithDataAsOrtValue`, providing the (validated) client's device pointer, tensor shape, data type, and an `OrtMemoryInfo` structure correctly identifying the memory as CUDA device memory (e.g., `OrtCUDAMemoryInfo`).
+            5.  **Execution:** The enclave binds these externally-backed `OrtValue`s using `OrtIoBinding` and executes the model with ONNX Runtime.
+            6.  **Synchronization:** Explicit CUDA stream and event synchronization (e.g., using ORT's `SynchronizeBoundInputs`/`SynchronizeBoundOutputs` or direct CUDA event mechanisms) is mandatory between the client's operations and the enclave's ORT inference calls.
+        *   **Key Challenges & Considerations for Direct ORT Device Memory:**
+            *   **Security & Gramine Integration:** Robust validation of external device pointers/handles within the shared enclave is critical. Gramine's memory mapping capabilities must ensure that such external device memory can be safely accessed without compromising SGX EPC protections. Securely importing/validating device memory handles (e.g., CUDA IPC) is preferable to raw pointers.
+            *   **ORT API Confirmation:** Thorough testing is needed to confirm `CreateTensorWithDataAsOrtValue` and related APIs behave as expected with externally owned CUDA device pointers in the shared enclave context for both inputs and outputs.
+            *   **Lifetime Management:** Clear protocols for managing the lifetime of client-provided device memory are essential; the memory must outlive its use by the enclave. `CreateTensorWithDataAndDeleterAsOrtValue` might be an option if temporary ownership transfer is feasible.
+            *   **Synchronization Complexity:** Implementing correct and efficient GPU synchronization across the client-enclave boundary is crucial.
+            *   **Performance Trade-offs:** The goal is to ensure that eliminating the DtoD copy results in a net performance gain by keeping the overheads of validation, memory mapping (if any), and synchronization lower than the DtoD copy time.
+    *   **Explore DMA for Output Data to Client's Pinned Host Memory:** Investigate optimizing the return of GPU computation results from the shared enclave to the client by using Direct Memory Access (DMA) to client-pre-allocated pinned host memory. This aims to bypass copying output data through the shared enclave's CPU memory and reduce overall latency.
+        *   **Implementation Sketch:**
+            1.  **Client-Side Allocation:** The client application allocates pinned host memory (e.g., using `cudaHostAlloc`) of sufficient size to hold the expected output data.
+            2.  **Buffer Information to Enclave:** The client transmits the host pointer and size of this pinned buffer to the shared enclave via IPC, along with the computation request.
+            3.  **Shared Enclave DtoH DMA:** After GPU computation, the shared enclave initiates an asynchronous Device-to-Host memory copy (e.g., `cudaMemcpyAsync`) from the GPU device buffer containing the result directly to the client's provided pinned host memory address.
+            4.  **Synchronization:** The shared enclave records a CUDA event after queueing the DtoH copy. The client must synchronize on this event (e.g., via `cudaEventSynchronize` after the event is made available or signaled through IPC) before safely accessing the data in its pinned buffer.
+        *   **Key Challenges & Considerations:**
+            *   **Security and Validation:** This is the most critical aspect. The shared enclave must rigorously validate the client-provided host pointer and size to ensure it's a legitimate, client-owned pinned memory region. Gramine's mechanisms must ensure that the shared enclave can only write to these specifically designated and validated client memory regions, preventing unauthorized access to other host memory. The risk of the shared enclave writing to arbitrary or malicious host locations due to compromised pointers or internal bugs needs careful mitigation.
+            *   **Gramine's Role in Host Memory Access:** Clarify and potentially enhance Gramine's support for allowing an enclave to target specific, client-provided external host memory regions for write operations initiated by CUDA driver calls (like `cudaMemcpyAsync`). This might involve pre-registration of allowable memory regions or other policy enforcement.
+            *   **API and Synchronization Complexity:** While CUDA APIs support this, managing the synchronization (events, IPC for event status) across the enclave boundary adds implementation complexity.
+            *   **Performance Benefits:** The primary benefit is avoiding a DtoH copy into the shared enclave's memory, followed by an IPC copy to the client. This can significantly reduce latency for large output tensors. The overheads of validation and synchronization must be less than the copy times saved.
 
 6. Raw Data (Placeholder)
 =========================

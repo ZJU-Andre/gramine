@@ -20,7 +20,9 @@ typedef enum {
     RETRIEVE_DATA,      // Legacy operation for simple retrieve
     VECTOR_ADD_REQUEST, // New operation type for vector addition
     ONNX_INFERENCE_REQUEST, // New operation type for ONNX inference
-    GEMM_REQUEST        // New operation type for SGEMM
+    GEMM_REQUEST,        // New operation type for SGEMM
+    BATCH_GPU_REQUEST,   // New operation type for batch mixed-sensitivity GPU workloads
+    POC_BATCH_GPU_REQUEST // POC for new batch mixed-sensitivity GPU workloads
 } operation_type_t;
 
 // This enum might still be useful for the legacy STORE_DATA/RETRIEVE_DATA operations
@@ -82,6 +84,12 @@ typedef struct {
     uint64_t src_device_ptr_b; 
     uint64_t src_device_ptr_c;
 
+    // DMA output: if masking_level is MASKING_NONE and dest_host_ptr_a is non-zero,
+    // the service will attempt to DMA the result directly to this client-provided
+    // pinned host memory address. Client ensures buffer is large enough.
+    uint64_t dest_host_ptr_a;
+    uint32_t dest_host_buffer_size_a; // Size of the client-provided buffer for A
+
 } vector_add_request_payload_t;
 
 typedef struct {
@@ -127,6 +135,12 @@ typedef struct {
     // the service will use this as source device pointer for DMA from client's
     // host-allocated pinned memory.
     uint64_t src_device_ptr_input_tensor;
+
+    // DMA output: if masking_level is MASKING_NONE and dest_host_ptr_output is non-zero,
+    // the service will attempt to DMA the ONNX output tensor directly to this
+    // client-provided pinned host memory address. Client ensures buffer is large enough.
+    uint64_t dest_host_ptr_output;
+    uint32_t dest_host_buffer_size_output; // Size of the client-provided buffer for output
 
 } onnx_inference_request_payload_t;
 
@@ -184,6 +198,12 @@ typedef struct {
     // host-allocated pinned memory.
     uint64_t src_device_ptr_matrix_a;
     uint64_t src_device_ptr_matrix_b;
+
+    // DMA output: if masking_level is MASKING_NONE and dest_host_ptr_c is non-zero,
+    // the service will attempt to DMA the result matrix C directly to this
+    // client-provided pinned host memory address. Client ensures buffer is large enough.
+    uint64_t dest_host_ptr_c;
+    uint32_t dest_host_buffer_size_c; // Size of the client-provided buffer for C
     
 } gemm_request_payload_t;
 
@@ -197,6 +217,79 @@ typedef struct {
     unsigned char masked_matrix_c[MAX_GEMM_MATRIX_SIZE_BYTES];
 
 } gemm_response_payload_t;
+
+
+// --- Structures for POC Batch Mixed-Sensitivity GPU Workloads ---
+
+#define MAX_SEGMENT_ID_LEN_POC 64
+#define MAX_GPU_OP_ID_LEN_POC 64
+#define MAX_ENCRYPTED_MANIFEST_SIZE_POC 1024
+#define MAX_INLINE_DATA_SIZE_POC 256 
+#define MAX_SEGMENTS_PER_BATCH_POC 4
+
+// Simplified manifest segment for POC
+typedef struct {
+    char segment_id[MAX_SEGMENT_ID_LEN_POC];
+    gpu_data_masking_level_t sensitivity_level_derived_masking; // Determines actual masking
+    int direction; // 0:input, 1:output, 2:input/output
+    char gpu_operation_id[MAX_GPU_OP_ID_LEN_POC];
+    uint32_t data_size_or_max_output_size; // Expected input size or max expected output size
+} poc_workload_manifest_segment_t;
+
+// POC Encrypted Manifest (part of the batch request)
+typedef struct {
+    unsigned char iv[GCM_IV_SIZE_BYTES];
+    unsigned char tag[GCM_TAG_SIZE_BYTES];
+    uint32_t encrypted_data_size;
+    unsigned char encrypted_data[MAX_ENCRYPTED_MANIFEST_SIZE_POC];
+} poc_encrypted_manifest_t;
+
+// POC IPC Segment Descriptor (part of the batch request)
+typedef struct {
+    char segment_id[MAX_SEGMENT_ID_LEN_POC]; // To link with manifest segment
+    gpu_data_masking_level_t masking_level;  // Actual masking to apply/expect
+    int direction;                           // Copied from manifest for service convenience
+    uint32_t data_size;                      // Size of input data, or max expected output size for validation
+
+    // Input specific fields
+    uint64_t src_device_ptr;                 // For MASKING_NONE DMA input
+    unsigned char iv_input[GCM_IV_SIZE_BYTES];     // For MASKING_AES_GCM input
+    unsigned char tag_input[GCM_TAG_SIZE_BYTES];   // For MASKING_AES_GCM input
+    unsigned char inline_input_data[MAX_INLINE_DATA_SIZE_POC]; // For small MASKING_AES_GCM input
+
+    // Output specific fields (for client to specify DMA output buffer)
+    uint64_t dest_host_ptr;                  // For MASKING_NONE DMA output
+    uint32_t dest_buffer_size;               // Size of client's DMA output buffer
+} poc_ipc_segment_descriptor_t;
+
+// POC Batch GPU Request Payload
+typedef struct {
+    poc_encrypted_manifest_t encrypted_manifest;
+    uint32_t num_segments; // Number of segments in the 'segments' array below
+    poc_ipc_segment_descriptor_t segments[MAX_SEGMENTS_PER_BATCH_POC];
+} poc_batch_gpu_request_payload_t;
+
+// POC IPC Segment Response (part of the batch response)
+typedef struct {
+    char segment_id[MAX_SEGMENT_ID_LEN_POC];
+    int status; // 0 for success, error code otherwise for this segment
+    gpu_data_masking_level_t masking_level_of_output; // Actual masking of output_data
+    uint32_t actual_output_data_size;          // Actual size of data in inline_output_data or written via DMA
+
+    // For MASKING_AES_GCM output:
+    unsigned char iv_output[GCM_IV_SIZE_BYTES];
+    unsigned char tag_output[GCM_TAG_SIZE_BYTES];
+    unsigned char inline_output_data[MAX_INLINE_DATA_SIZE_POC]; // For small MASKING_AES_GCM output
+    // Note: For DMA output, data is written directly to client's dest_host_ptr,
+    // so inline_output_data would not be used.
+} poc_ipc_segment_response_t;
+
+// POC Batch GPU Response Payload
+typedef struct {
+    int overall_batch_status; // 0 for overall success, or an error code
+    uint32_t num_segments;    // Number of segments in the 'segment_responses' array
+    poc_ipc_segment_response_t segment_responses[MAX_SEGMENTS_PER_BATCH_POC];
+} poc_batch_gpu_response_payload_t;
 
 
 /*
@@ -230,5 +323,162 @@ typedef struct {
  *   memcpy(msg_to_send.data, &gemm_payload, sizeof(gemm_payload));
  *   ipc_send_msg_and_get_response(dest_vmid, &msg_to_send, &response_msg_ptr);
  */
+
+
+// --- Structures for Batch Mixed-Sensitivity GPU Workloads ---
+
+#define MAX_SEGMENT_ID_LEN 64
+#define MAX_DATA_LOCATION_HINT_LEN 256 // Could be a path or descriptor
+#define MAX_GPU_OPERATION_ID_LEN 64
+#define MAX_SEGMENTS_PER_MANIFEST 16 // For POC
+
+// Enum for data sensitivity level (distinct from masking_level which is about crypto)
+typedef enum {
+    SENSITIVITY_LEVEL_LOW,    // Suggests MASKING_NONE with DMA
+    SENSITIVITY_LEVEL_HIGH    // Suggests MASKING_AES_GCM
+    // SENSITIVITY_LEVEL_MEDIUM could be added if a distinct path is defined later
+} segment_sensitivity_level_t;
+
+// Enum for segment data direction
+typedef enum {
+    DATA_DIRECTION_INPUT,
+    DATA_DIRECTION_OUTPUT,
+    DATA_DIRECTION_INPUT_OUTPUT // For data that is modified in-place
+} segment_data_direction_t;
+
+// Structure defining a single data segment within a workload manifest
+typedef struct {
+    char segment_id[MAX_SEGMENT_ID_LEN];
+    segment_sensitivity_level_t sensitivity_level;
+    segment_data_direction_t direction;
+
+    // Hint for client library to find/prepare data.
+    // For INPUT: path to file, or identifier for pre-loaded client memory.
+    // For OUTPUT: identifier for client to store/name the output.
+    char data_location_hint[MAX_DATA_LOCATION_HINT_LEN];
+
+    // GPU operation this segment is associated with.
+    // Allows shared enclave to map segments to specific GPU kernels/streams.
+    char gpu_operation_id[MAX_GPU_OPERATION_ID_LEN];
+
+    // For OUTPUT segments using DMA (sensitivity_level LOW):
+    // Client specifies the size of the pinned host buffer it has prepared.
+    // Service will validate if actual output fits.
+    uint32_t client_dma_output_buffer_size; 
+    // Note: The actual client host pointer for output DMA will be in ipc_segment_descriptor_t
+
+    // Optional: For typed data, can include hints for dimensions, datatype etc.
+    // For POC, keeping it simpler. Example:
+    // uint32_t expected_data_size_bytes; 
+    // int dimensions[4];
+    // data_type_t type_enum;
+
+} workload_manifest_segment_t;
+
+// Structure for the overall workload manifest
+#define MAX_MANIFEST_ID_LEN 64
+typedef struct {
+    char manifest_id[MAX_MANIFEST_ID_LEN]; // Unique ID for this manifest version/type
+    uint32_t num_segments;
+    workload_manifest_segment_t segments[MAX_SEGMENTS_PER_MANIFEST];
+    // uint8_t reserved[...]; // For future expansion, alignment
+} workload_manifest_t;
+
+
+// --- Structures for Batch IPC Communication (based on Workload Manifest) ---
+
+// Max size for inline data in segment descriptors (e.g., for small AES-GCM payloads)
+#define MAX_INLINE_SEGMENT_DATA_SIZE 256 // POC value, adjust as needed
+#define MAX_ENCRYPTED_MANIFEST_SIZE 2048 // POC value for encrypted manifest
+
+// Describes a single segment within a batch IPC request/response
+typedef struct {
+    char segment_id[MAX_SEGMENT_ID_LEN]; // Corresponds to workload_manifest_segment_t.segment_id
+    gpu_data_masking_level_t masking_level; // MASKING_AES_GCM or MASKING_NONE for this segment
+
+    // --- Input Data Fields ---
+    // Used if direction is INPUT or INPUT_OUTPUT in the manifest
+
+    // For MASKING_AES_GCM (input):
+    unsigned char iv[GCM_IV_SIZE_BYTES];
+    unsigned char tag[GCM_TAG_SIZE_BYTES];
+    uint32_t encrypted_data_size; // Actual size of encrypted_data following
+    // For small data, can be inlined. For larger, consider separate transfer or use DMA if appropriate.
+    // For POC, allow small inline data.
+    unsigned char encrypted_data[MAX_INLINE_SEGMENT_DATA_SIZE]; 
+
+    // For MASKING_NONE with DMA (input):
+    uint64_t src_device_ptr; // Client's device pointer for input data
+    uint32_t input_data_size;  // Actual size of input data at src_device_ptr
+
+    // --- Output Data Fields (passed in request for DMA output setup) ---
+    // Used if direction is OUTPUT or INPUT_OUTPUT in the manifest and MASKING_NONE with DMA
+
+    // For MASKING_NONE with DMA (output):
+    uint64_t dest_host_ptr;           // Client's host pinned memory pointer for output
+    uint32_t dest_buffer_size_bytes;  // Size of client's output buffer
+
+    // GPU operation ID this segment is for (copied from manifest for service routing)
+    char gpu_operation_id[MAX_GPU_OPERATION_ID_LEN];
+
+} ipc_segment_descriptor_t;
+
+
+// Batch GPU Request Payload
+// This structure is sent from the client to the shared service.
+typedef struct {
+    // Encrypted Workload Manifest
+    unsigned char encrypted_manifest_iv[GCM_IV_SIZE_BYTES];
+    unsigned char encrypted_manifest_tag[GCM_TAG_SIZE_BYTES];
+    uint32_t encrypted_manifest_size;
+    // For POC, inline encrypted manifest. Could be a handle/reference if manifest is pre-registered.
+    unsigned char encrypted_manifest_data[MAX_ENCRYPTED_MANIFEST_SIZE]; 
+
+    uint32_t num_segments; // Number of segments described in segment_descriptors array
+                           // This count includes all segments (input, output, input_output)
+                           // for which descriptors are being sent.
+    ipc_segment_descriptor_t segment_descriptors[MAX_SEGMENTS_PER_MANIFEST]; 
+    // Contains descriptors for all segments involved.
+    // For input segments, it carries the data (or pointers to it).
+    // For output segments using DMA, it carries the client's destination host pointer and buffer size.
+    // For output segments using AES-GCM, the corresponding descriptor here might be minimal,
+    // as the actual encrypted output data will come in the ipc_segment_response_t.
+
+} batch_gpu_request_payload_t;
+
+
+// Describes a single segment's result in a batch IPC response
+// This structure is part of the batch_gpu_response_payload_t sent from service to client.
+typedef struct {
+    char segment_id[MAX_SEGMENT_ID_LEN];
+    int status; // 0 for success, error code otherwise for this segment's processing
+
+    // For MASKING_AES_GCM (output):
+    // These fields are populated if the segment (as defined in manifest) was an output
+    // and used AES-GCM.
+    unsigned char iv[GCM_IV_SIZE_BYTES];
+    unsigned char tag[GCM_TAG_SIZE_BYTES];
+    uint32_t encrypted_data_size; // Actual size of encrypted_data
+    unsigned char encrypted_data[MAX_INLINE_SEGMENT_DATA_SIZE]; // For small outputs
+
+    // For MASKING_NONE with DMA (output):
+    // This field is populated if the segment was an output and used DMA.
+    uint32_t actual_output_data_size; // Actual bytes written to client's dest_host_ptr
+
+    // Other per-segment result info can be added here if needed.
+
+} ipc_segment_response_t;
+
+
+// Batch GPU Response Payload
+typedef struct {
+    int overall_batch_status; // 0 for overall success, or an error code for the batch processing
+    uint32_t num_segments;    // Number of segments for which results/status are being returned
+                              // This typically matches the number of segments that were marked as
+                              // OUTPUT or INPUT_OUTPUT in the manifest and processed.
+    ipc_segment_response_t segments[MAX_SEGMENTS_PER_MANIFEST]; // Array of segment responses
+
+} batch_gpu_response_payload_t;
+
 
 #endif // SHARED_SERVICE_H

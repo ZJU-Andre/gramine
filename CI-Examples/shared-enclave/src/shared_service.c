@@ -27,6 +27,12 @@ static const unsigned char g_shared_enclave_aes_key[GCM_KEY_SIZE_BYTES] = {
     0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f
 };
 
+// POC Session Key for Manifest Encryption/Decryption
+static const unsigned char g_manifest_poc_session_key[GCM_KEY_SIZE_BYTES] = {
+    0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f,
+    0x20, 0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28, 0x29, 0x2a, 0x2b, 0x2c, 0x2d, 0x2e, 0x2f
+};
+
 static void generate_iv_for_response(unsigned char* iv, size_t iv_len) {
     for (size_t i = 0; i < iv_len; ++i) iv[i] = (unsigned char)(rand() % 256);
 }
@@ -50,10 +56,17 @@ static void handle_vector_add_request(const vector_add_request_payload_t* req, v
     if (req->array_len_elements == 0 || req->array_len_elements > VECTOR_ARRAY_MAX_ELEMENTS) {
         resp->status = -EINVAL; return;
     }
-    size_t data_sz = req->array_len_elements * sizeof(float);
+    size_t data_sz = req->array_len_elements * sizeof(float); // Define data_sz early
+
+    bool use_dma_for_output_a = (req->masking_level == MASKING_NONE && 
+                                 req->dest_host_ptr_a != 0 && 
+                                 req->dest_host_buffer_size_a >= data_sz);
+
     float *b_plain = NULL; // Will be allocated if not using DMA for B
     float *c_plain = NULL; // Will be allocated if not using DMA for C
-    float *a_result_plain = (float*)malloc(data_sz); // Result A always allocated on host in service
+    // a_result_plain is allocated as it's used as a fallback by launch_vector_add_cuda
+    // and for AES-GCM output path.
+    float *a_result_plain = (float*)malloc(data_sz); 
 
     if (!a_result_plain) { resp->status = -ENOMEM; goto cleanup_va; }
 
@@ -97,30 +110,55 @@ static void handle_vector_add_request(const vector_add_request_payload_t* req, v
     }
     
     int cuda_err_code = 0; const char* cuda_err_str = NULL;
-    // Pass b_plain and c_plain (which can be NULL if DMA is used for them)
-    // launch_vector_add_cuda will use d_ptr_b_client/d_ptr_c_client if use_dma_for_b/c is true.
-    if (launch_vector_add_cuda(a_result_plain, 
-                               b_plain, // Can be NULL if use_dma_for_b is true
-                               c_plain, // Can be NULL if use_dma_for_c is true
-                               req->array_len_elements, 
-                               &cuda_err_code, &cuda_err_str,
-                               use_dma_for_b, req->src_device_ptr_b,
-                               use_dma_for_c, req->src_device_ptr_c) != 0) {
+
+    if (use_dma_for_output_a) {
+        printf("  DMA path for output A. Client's host pointer: 0x%lx, buffer size: %u\n", 
+               req->dest_host_ptr_a, req->dest_host_buffer_size_a);
+        // TODO: CRITICAL SECURITY - Validate client-provided dest_host_ptr_a and dest_host_buffer_size_a.
+        // Ensure the pointer is valid, within client's allowed memory, and size is sufficient.
+        // This likely requires Gramine PAL support for safe cross-boundary memory access validation.
+        // Current check (dest_host_buffer_size_a >= data_sz) is a basic sanity check.
+    }
+
+    // Updated call to launch_vector_add_cuda with output DMA parameters
+    if (launch_vector_add_cuda(
+            use_dma_for_output_a,       // Pass the flag for output DMA
+            req->dest_host_ptr_a,       // Pass client's host pointer for output A
+            a_result_plain,             // Pass host buffer as fallback
+            b_plain,                    // Can be NULL if use_dma_for_b is true
+            c_plain,                    // Can be NULL if use_dma_for_c is true
+            req->array_len_elements, 
+            &cuda_err_code, &cuda_err_str,
+            use_dma_for_b, req->src_device_ptr_b,
+            use_dma_for_c, req->src_device_ptr_c
+        ) != 0) {
         fprintf(stderr, "SHARED_SERVICE_ERROR: launch_vector_add_cuda failed. Code: %d, Str: %s\n", cuda_err_code, cuda_err_str ? cuda_err_str : "N/A");
         resp->status = cuda_err_code != 0 ? cuda_err_code : -1; goto cleanup_va;
     }
     
     resp->array_len_elements = req->array_len_elements;
-    if (resp->masking_level == MASKING_AES_GCM) {
-        printf("  Encrypting result vector A (AES-GCM)...\n");
-        generate_iv_for_response(resp->iv_a, GCM_IV_SIZE_BYTES);
-        if (libos_aes_gcm_encrypt(g_shared_enclave_aes_key, resp->iv_a, (unsigned char*)a_result_plain, data_sz, resp->data_a, resp->tag_a, NULL, 0) != 0) {
-            fprintf(stderr, "SHARED_SERVICE_ERROR: Encryption failed for vector_add result.\n");
-            resp->status = -EPERM; goto cleanup_va; 
+
+    if (use_dma_for_output_a) {
+        printf("  Result vector A written directly to client's host memory via DMA.\n");
+        // Data is directly in client's buffer. Zero out the payload part for data_a.
+        // IV and Tag are not applicable for DMA output, ensure they are zeroed (already done by initial memset of resp).
+        memset(resp->data_a, 0, sizeof(resp->data_a)); 
+        // If resp was not fully memset at the start, zero IV and Tag here:
+        // memset(resp->iv_a, 0, GCM_IV_SIZE_BYTES);
+        // memset(resp->tag_a, 0, GCM_TAG_SIZE_BYTES);
+    } else {
+        // Fallback: Populate resp->data_a using a_result_plain (which launch_vector_add_cuda filled)
+        if (resp->masking_level == MASKING_AES_GCM) {
+            printf("  Encrypting result vector A (AES-GCM) from fallback buffer...\n");
+            generate_iv_for_response(resp->iv_a, GCM_IV_SIZE_BYTES);
+            if (libos_aes_gcm_encrypt(g_shared_enclave_aes_key, resp->iv_a, (unsigned char*)a_result_plain, data_sz, resp->data_a, resp->tag_a, NULL, 0) != 0) {
+                fprintf(stderr, "SHARED_SERVICE_ERROR: Encryption failed for vector_add result.\n");
+                resp->status = -EPERM; goto cleanup_va; 
+            }
+        } else { // MASKING_NONE (but not DMA output, so copy to payload)
+            printf("  Copying plaintext result vector A from fallback buffer to response...\n");
+            memcpy(resp->data_a, a_result_plain, data_sz);
         }
-    } else { // MASKING_NONE
-        printf("  Copying plaintext result vector A to response...\n");
-        memcpy(resp->data_a, a_result_plain, data_sz);
     }
     resp->status = 0;
 cleanup_va:
@@ -195,34 +233,20 @@ static void handle_onnx_inference_request(const onnx_inference_request_payload_t
     }
 
     unsigned char* p_input_plaintext = NULL; // Host buffer for input, used if not DMA
-    float* d_enclave_input_tensor = NULL; // Device buffer for input, allocated by enclave for DMA path
-    void* tensor_data_source = NULL; // Will point to p_input_plaintext or d_enclave_input_tensor
+    // d_enclave_input_tensor is no longer allocated by the enclave in the DMA path.
+    // It will remain NULL if use_dma_input_tensor is true.
+    float* d_enclave_input_tensor = NULL; 
+    void* tensor_data_source = NULL; // Will point to p_input_plaintext or client's device_ptr
 
     bool use_dma_input_tensor = (req->masking_level == MASKING_NONE && req->src_device_ptr_input_tensor != 0);
 
     if (use_dma_input_tensor) {
-        printf("  DMA path for ONNX input. Client device pointer: 0x%lx, Size: %u bytes\n", 
+        printf("  DMA path for ONNX input. Using client's device pointer directly: 0x%lx, Size: %u bytes\n",
                req->src_device_ptr_input_tensor, req->input_tensor_size_bytes);
         
-        // 1. Allocate device buffer within the enclave
-        cudaError_t cuda_err = cudaMalloc((void**)&d_enclave_input_tensor, req->input_tensor_size_bytes);
-        if (cuda_err != cudaSuccess) {
-            fprintf(stderr, "SHARED_SERVICE_ONNX_ERROR: cudaMalloc for d_enclave_input_tensor failed: %s\n", cudaGetErrorString(cuda_err));
-            resp->status = -ENOMEM; goto cleanup_onnx;
-        }
-        printf("  Allocated d_enclave_input_tensor: %p\n", d_enclave_input_tensor);
-
-        // 2. Copy from client's device pointer to enclave's device buffer
-        cuda_err = cudaMemcpy(d_enclave_input_tensor, 
-                              (void*)req->src_device_ptr_input_tensor, 
-                              req->input_tensor_size_bytes, 
-                              cudaMemcpyDeviceToDevice); // Assuming client pointer is also device pointer
-        if (cuda_err != cudaSuccess) {
-            fprintf(stderr, "SHARED_SERVICE_ONNX_ERROR: cudaMemcpy DtoD for input tensor failed: %s\n", cudaGetErrorString(cuda_err));
-            resp->status = -EIO; goto cleanup_onnx;
-        }
-        printf("  Copied data from client device pointer to d_enclave_input_tensor.\n");
-        tensor_data_source = d_enclave_input_tensor;
+        // Client's device pointer will be used directly. No allocation or DtoD copy in enclave.
+        tensor_data_source = (void*)req->src_device_ptr_input_tensor;
+        // d_enclave_input_tensor remains NULL for this path.
 
     } else { // Non-DMA path (AES-GCM or MASKING_NONE with data in payload)
         p_input_plaintext = (unsigned char*)malloc(req->input_tensor_size_bytes);
@@ -251,21 +275,23 @@ static void handle_onnx_inference_request(const onnx_inference_request_payload_t
     OrtValue *in_tensor = NULL, *out_tensor = NULL;
     OrtStatus* ort_status = NULL;
     
-    // Create OrtValue pointing to the correct memory (device or host)
+    // Create OrtValue pointing to the correct memory (client's device or enclave's host)
     // ONNX Runtime needs to know the memory type. For CUDA, it needs a OrtMemoryInfo.
     OrtMemoryInfo* mem_info = NULL;
-    if (use_dma_input_tensor) { // Data is on GPU device (in d_enclave_input_tensor)
-        printf("  Creating ONNX input tensor from enclave's device memory (%p).\n", d_enclave_input_tensor);
+    if (use_dma_input_tensor) { // Data is on client's GPU device memory
+        printf("  Creating ONNX input tensor from client's device memory (0x%lx).\n", req->src_device_ptr_input_tensor);
         // Create OrtMemoryInfo for CUDA device memory
+        // Assuming device_id 0. If multiple GPUs, this might need to be configurable or queried.
         ort_status = g_ort_api->CreateMemoryInfo("Cuda", OrtDeviceAllocator, 0, OrtMemTypeDevice, &mem_info);
-        if (handle_ort_status(ort_status, "CreateMemoryInfo_Cuda") != 0) goto cleanup_onnx;
-    } else { // Data is on CPU host memory (in p_input_plaintext)
+        if (handle_ort_status(ort_status, "CreateMemoryInfo_Cuda_DMA") != 0) goto cleanup_onnx;
+    } else { // Data is on enclave's CPU host memory (in p_input_plaintext)
         printf("  Creating ONNX input tensor from enclave's host memory (%p).\n", p_input_plaintext);
         // OrtMemoryInfo for CPU memory (default)
         ort_status = g_ort_api->CreateCpuMemoryInfo(OrtArenaAllocator, OrtMemTypeDefault, &mem_info);
         if (handle_ort_status(ort_status, "CreateMemoryInfo_Cpu") != 0) goto cleanup_onnx;
     }
 
+    // tensor_data_source now correctly points to either client's device_ptr or enclave's p_input_plaintext
     ort_status = g_ort_api->CreateTensorWithDataAsOrtValue(mem_info, tensor_data_source, req->input_tensor_size_bytes, input_shape, 4, ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, &in_tensor);
     if (g_ort_api && mem_info) g_ort_api->ReleaseMemoryInfo(mem_info); // Release mem_info after use
     if (handle_ort_status(ort_status, "CreateTensorWithDataAsOrtValue") != 0) goto cleanup_onnx;
@@ -293,19 +319,61 @@ static void handle_onnx_inference_request(const onnx_inference_request_payload_t
     g_ort_api->ReleaseTensorTypeAndShapeInfo(shape_info);
     if (handle_ort_status(ort_status, "GetOutputElementCount") != 0) goto cleanup_onnx;
     uint32_t out_bytes = num_out_elements * sizeof(float);
-    if (out_bytes > MAX_ONNX_OUTPUT_SIZE_BYTES) { resp->status = -EFBIG; goto cleanup_onnx; }
+    if (out_bytes > MAX_ONNX_OUTPUT_SIZE_BYTES) { 
+        fprintf(stderr, "SHARED_SERVICE_ONNX_ERROR: Output tensor size %u exceeds MAX_ONNX_OUTPUT_SIZE_BYTES %d.\n", out_bytes, MAX_ONNX_OUTPUT_SIZE_BYTES);
+        resp->status = -EFBIG; 
+        goto cleanup_onnx; 
+    }
     
-    resp->output_tensor_size_bytes = out_bytes;
-    if (resp->masking_level == MASKING_AES_GCM) {
-        printf("  Encrypting output tensor (AES-GCM)...\n");
-        generate_iv_for_response(resp->iv, GCM_IV_SIZE_BYTES);
-        if (libos_aes_gcm_encrypt(g_shared_enclave_aes_key, resp->iv, (unsigned char*)out_data_ptr_const, out_bytes, resp->output_tensor, resp->tag, NULL, 0) != 0) {
-            fprintf(stderr, "SHARED_SERVICE_ONNX_ERROR: Encryption of output tensor failed.\n");
-            resp->status = -EPERM; goto cleanup_onnx;
+    resp->output_tensor_size_bytes = out_bytes; // Set the actual size for the client
+
+    bool use_dma_for_output = (req->masking_level == MASKING_NONE && 
+                               req->dest_host_ptr_output != 0);
+
+    if (use_dma_for_output) {
+        if (req->dest_host_buffer_size_output >= out_bytes) {
+            printf("  DMA path for ONNX output. Client host pointer: 0x%lx, buffer size: %u, data size: %u\n",
+                   req->dest_host_ptr_output, req->dest_host_buffer_size_output, out_bytes);
+
+            // TODO: CRITICAL SECURITY - Validate client-provided dest_host_ptr_output and dest_host_buffer_size_output.
+            // Ensure the pointer is valid, within client's allowed memory, and size is sufficient.
+            // This likely requires Gramine PAL support. For now, we rely on the client providing a valid pinned memory pointer.
+
+            cudaError_t cpy_err = cudaMemcpy((void*)req->dest_host_ptr_output, 
+                                             out_data_ptr_const, // This is assumed to be a device pointer from ORT Run
+                                             out_bytes, 
+                                             cudaMemcpyDeviceToHost);
+            if (cpy_err != cudaSuccess) {
+                fprintf(stderr, "SHARED_SERVICE_ONNX_ERROR: cudaMemcpy DtoH to client's host pointer failed: %s\n", cudaGetErrorString(cpy_err));
+                resp->status = -EIO; // Indicate I/O error
+                // Fallback to payload path is complex here as client expects DMA or error. 
+                // For now, just error out.
+                goto cleanup_onnx;
+            }
+            printf("  ONNX output tensor (%u bytes) copied directly to client's host memory via DMA.\n", out_bytes);
+            // IV and Tag are not used for DMA output, ensure they are zeroed (should be by initial memset of resp)
+            memset(resp->output_tensor, 0, sizeof(resp->output_tensor)); 
+            memset(resp->iv, 0, sizeof(resp->iv));
+            memset(resp->tag, 0, sizeof(resp->tag));
+        } else {
+            fprintf(stderr, "SHARED_SERVICE_ONNX_WARNING: DMA for output requested, but client buffer size (%u) is too small for output data (%u). Falling back to payload.\n",
+                    req->dest_host_buffer_size_output, out_bytes);
+            use_dma_for_output = false; // Disable DMA output and fallback
         }
-    } else { // MASKING_NONE
-        printf("  Copying plaintext output tensor to response...\n");
-        memcpy(resp->output_tensor, out_data_ptr_const, out_bytes);
+    }
+
+    if (!use_dma_for_output) { // Fallback or non-DMA path
+        if (resp->masking_level == MASKING_AES_GCM) {
+            printf("  Encrypting output tensor (AES-GCM) into response payload...\n");
+            generate_iv_for_response(resp->iv, GCM_IV_SIZE_BYTES);
+            if (libos_aes_gcm_encrypt(g_shared_enclave_aes_key, resp->iv, (unsigned char*)out_data_ptr_const, out_bytes, resp->output_tensor, resp->tag, NULL, 0) != 0) {
+                fprintf(stderr, "SHARED_SERVICE_ONNX_ERROR: Encryption of output tensor failed.\n");
+                resp->status = -EPERM; goto cleanup_onnx;
+            }
+        } else { // MASKING_NONE (and not DMA, or DMA fallback)
+            printf("  Copying plaintext output tensor to response payload...\n");
+            memcpy(resp->output_tensor, out_data_ptr_const, out_bytes);
+        }
     }
     resp->status = 0;
 cleanup_onnx:
@@ -313,18 +381,22 @@ cleanup_onnx:
         if (in_tensor) g_ort_api->ReleaseValue(in_tensor); 
         if (out_tensor) g_ort_api->ReleaseValue(out_tensor); 
     }
-    if (p_input_plaintext) { // Free host buffer if it was allocated
+    if (p_input_plaintext) { // Free host buffer if it was allocated (non-DMA path)
         printf("  Freeing host buffer p_input_plaintext.\n");
         free(p_input_plaintext);
         p_input_plaintext = NULL;
     }
-    if (d_enclave_input_tensor) { // Free enclave's device buffer if it was allocated
-        printf("  Freeing enclave's device buffer d_enclave_input_tensor (%p).\n", d_enclave_input_tensor);
+    // d_enclave_input_tensor is only allocated in the non-DMA path if that path were to use
+    // a separate device buffer. Currently, the non-DMA path uses host memory (p_input_plaintext)
+    // and CreateTensorWithDataAsOrtValue handles the HtoD copy internally if needed by ORT.
+    // If d_enclave_input_tensor was allocated (e.g., in a previous version or a different logic branch),
+    // this would free it. In the current DMA path, d_enclave_input_tensor is NULL.
+    if (d_enclave_input_tensor) { 
+        printf("  Freeing enclave's device buffer d_enclave_input_tensor (%p) - this should not happen in DMA path.\n", d_enclave_input_tensor);
         cudaError_t free_err = cudaFree(d_enclave_input_tensor);
         if (free_err != cudaSuccess) {
             fprintf(stderr, "SHARED_SERVICE_ONNX_ERROR: cudaFree for d_enclave_input_tensor failed: %s\n", cudaGetErrorString(free_err));
-            // Potentially override resp->status if it was success before this
-            if (resp->status == 0) resp->status = -EIO; // Indicate error during cleanup
+            if (resp->status == 0) resp->status = -EIO;
         }
         d_enclave_input_tensor = NULL;
     }
@@ -384,13 +456,19 @@ static void handle_gemm_request(const gemm_request_payload_t* req, gemm_response
 
     bool use_dma_matrix_a = (req->masking_level == MASKING_NONE && req->src_device_ptr_matrix_a != 0);
     bool use_dma_matrix_b = (req->masking_level == MASKING_NONE && req->src_device_ptr_matrix_b != 0);
-
-    // Allocate host buffer for result matrix C (always needed for response)
-    resp->matrix_c_size_bytes = (size_t)req->M * req->N * sizeof(float);
+    
+    resp->matrix_c_size_bytes = (size_t)req->M * req->N * sizeof(float); // Calculate size of C
     if (resp->matrix_c_size_bytes > MAX_GEMM_MATRIX_SIZE_BYTES) { 
-        fprintf(stderr, "SHARED_SERVICE_CUBLAS_ERROR: Result matrix C size exceeds MAX_GEMM_MATRIX_SIZE_BYTES.\n");
+        fprintf(stderr, "SHARED_SERVICE_CUBLAS_ERROR: Result matrix C size %zu exceeds MAX_GEMM_MATRIX_SIZE_BYTES %d.\n",
+                resp->matrix_c_size_bytes, MAX_GEMM_MATRIX_SIZE_BYTES);
         resp->status = -EFBIG; goto cleanup_gemm; 
     }
+
+    bool use_dma_for_output_c = (req->masking_level == MASKING_NONE && 
+                                 req->dest_host_ptr_c != 0 &&
+                                 req->dest_host_buffer_size_c >= resp->matrix_c_size_bytes);
+
+    // pC_result_plain is allocated as it's used as a fallback or for AES-GCM path
     pC_result_plain = (float*)malloc(resp->matrix_c_size_bytes);
     if (!pC_result_plain) { 
         fprintf(stderr, "SHARED_SERVICE_CUBLAS_ERROR: Failed to allocate host memory for pC_result_plain.\n");
@@ -485,22 +563,46 @@ static void handle_gemm_request(const gemm_request_payload_t* req, gemm_response
         fprintf(stderr, "SHARED_SERVICE_CUBLAS_ERROR: cublasSgemm failed: %s\n", cublasGetErrorString(cblas_stat));
         resp->status = -EIO; goto cleanup_gemm_gpu;
     }
-    cuda_err = cudaMemcpy(pC_result_plain, dC, resp->matrix_c_size_bytes, cudaMemcpyDeviceToHost);
-    if (cuda_err != cudaSuccess) {
-        fprintf(stderr, "SHARED_SERVICE_CUBLAS_ERROR: cudaMemcpy DtoH for result matrix C failed: %s\n", cudaGetErrorString(cuda_err));
-        resp->status = -EIO; goto cleanup_gemm_gpu;
-    }
-    
-    if (resp->masking_level == MASKING_AES_GCM) {
-        printf("  Encrypting result matrix C (AES-GCM)...\n");
-        generate_iv_for_response(resp->iv_c, GCM_IV_SIZE_BYTES);
-        if (libos_aes_gcm_encrypt(g_shared_enclave_aes_key, resp->iv_c, (unsigned char*)pC_result_plain, resp->matrix_c_size_bytes, resp->matrix_c, resp->tag_c, NULL, 0) != 0) {
-            fprintf(stderr, "SHARED_SERVICE_CUBLAS_ERROR: Encryption failed for GEMM result.\n");
-            resp->status = -EPERM; goto cleanup_gemm_gpu;
+
+    if (use_dma_for_output_c) {
+        printf("  DMA path for output Matrix C. Client's host pointer: 0x%lx, buffer size: %u, data size: %u\n",
+               req->dest_host_ptr_c, req->dest_host_buffer_size_c, resp->matrix_c_size_bytes);
+        
+        // TODO: CRITICAL SECURITY - Validate client-provided dest_host_ptr_c and dest_host_buffer_size_c.
+        // This is vital to prevent writes to arbitrary enclave/host memory.
+        // Requires robust Gramine PAL support for cross-boundary memory validation.
+
+        cuda_err = cudaMemcpy((void*)req->dest_host_ptr_c, dC, resp->matrix_c_size_bytes, cudaMemcpyDeviceToHost);
+        if (cuda_err != cudaSuccess) {
+            fprintf(stderr, "SHARED_SERVICE_CUBLAS_ERROR: cudaMemcpy DtoH to client's host pointer failed: %s\n", cudaGetErrorString(cuda_err));
+            resp->status = -EIO;
+            goto cleanup_gemm_gpu; // Error out if DMA copy fails
         }
-    } else { // MASKING_NONE
-        printf("  Copying plaintext result matrix C to response...\n");
-        memcpy(resp->matrix_c, pC_result_plain, resp->matrix_c_size_bytes);
+        printf("  Matrix C (%u bytes) copied directly to client's host memory via DMA.\n", resp->matrix_c_size_bytes);
+        // Zero out the payload part for matrix_c, iv_c, tag_c as they are not used.
+        memset(resp->matrix_c, 0, sizeof(resp->matrix_c));
+        memset(resp->iv_c, 0, sizeof(resp->iv_c));
+        memset(resp->tag_c, 0, sizeof(resp->tag_c));
+    } else {
+        // Fallback: Copy dC to pC_result_plain first
+        cuda_err = cudaMemcpy(pC_result_plain, dC, resp->matrix_c_size_bytes, cudaMemcpyDeviceToHost);
+        if (cuda_err != cudaSuccess) {
+            fprintf(stderr, "SHARED_SERVICE_CUBLAS_ERROR: cudaMemcpy DtoH to pC_result_plain failed: %s\n", cudaGetErrorString(cuda_err));
+            resp->status = -EIO; goto cleanup_gemm_gpu;
+        }
+
+        // Then handle AES-GCM or plaintext copy to response payload from pC_result_plain
+        if (resp->masking_level == MASKING_AES_GCM) {
+            printf("  Encrypting result matrix C (AES-GCM) from fallback buffer into response payload...\n");
+            generate_iv_for_response(resp->iv_c, GCM_IV_SIZE_BYTES);
+            if (libos_aes_gcm_encrypt(g_shared_enclave_aes_key, resp->iv_c, (unsigned char*)pC_result_plain, resp->matrix_c_size_bytes, resp->matrix_c, resp->tag_c, NULL, 0) != 0) {
+                fprintf(stderr, "SHARED_SERVICE_CUBLAS_ERROR: Encryption failed for GEMM result.\n");
+                resp->status = -EPERM; goto cleanup_gemm_gpu;
+            }
+        } else { // MASKING_NONE (but not DMA output, or DMA fallback due to size mismatch)
+            printf("  Copying plaintext result matrix C from fallback buffer to response payload...\n");
+            memcpy(resp->matrix_c, pC_result_plain, resp->matrix_c_size_bytes);
+        }
     }
     resp->status = 0;
 
@@ -522,6 +624,198 @@ cleanup_gemm:
     
     printf("SHARED_SERVICE_LOG: Finished GEMM_REQUEST with status %d.\n", resp->status);
 }
+
+// --- Batch GPU Request Handler ---
+static void handle_batch_gpu_request(const batch_gpu_request_payload_t* req, batch_gpu_response_payload_t* resp) {
+    printf("SHARED_SERVICE_LOG: Handling BATCH_GPU_REQUEST...\n");
+    resp->overall_batch_status = -1; // Default to error
+    resp->num_segments = 0;      // Initialize to 0, will be set later based on processed outputs
+
+    workload_manifest_t plaintext_manifest;
+    memset(&plaintext_manifest, 0, sizeof(workload_manifest_t));
+
+    // 1. Decrypt the manifest
+    printf("  Decrypting workload manifest (size: %u bytes)...\n", req->encrypted_manifest_size);
+    if (req->encrypted_manifest_size == 0 || req->encrypted_manifest_size > sizeof(workload_manifest_t)) {
+        fprintf(stderr, "SHARED_SERVICE_BATCH_ERROR: Invalid encrypted manifest size: %u.\n", req->encrypted_manifest_size);
+        resp->overall_batch_status = -EINVAL;
+        return;
+    }
+
+    int dec_ret = libos_aes_gcm_decrypt(g_manifest_poc_session_key, 
+                                        req->encrypted_manifest_iv,
+                                        req->encrypted_manifest_data,
+                                        req->encrypted_manifest_size,
+                                        req->encrypted_manifest_tag,
+                                        (unsigned char*)&plaintext_manifest, // Output buffer
+                                        NULL, 0); // No AAD
+
+    if (dec_ret != 0) {
+        fprintf(stderr, "SHARED_SERVICE_BATCH_ERROR: Manifest decryption failed. Status: %d\n", dec_ret);
+        resp->overall_batch_status = -EPERM; // Permission denied or decryption error
+        return;
+    }
+    printf("  Manifest decrypted successfully.\n");
+
+    // 2. Basic Manifest Parsing/Validation
+    if (plaintext_manifest.num_segments == 0 || plaintext_manifest.num_segments > MAX_SEGMENTS_PER_MANIFEST) {
+        fprintf(stderr, "SHARED_SERVICE_BATCH_ERROR: Invalid num_segments (%u) in decrypted manifest. Max allowed: %d.\n",
+                plaintext_manifest.num_segments, MAX_SEGMENTS_PER_MANIFEST);
+        resp->overall_batch_status = -EINVAL;
+        return;
+    }
+    // Ensure manifest_id is null-terminated before logging, as it's a char array
+    char manifest_id_for_log[MAX_MANIFEST_ID_LEN + 1];
+    strncpy(manifest_id_for_log, plaintext_manifest.manifest_id, MAX_MANIFEST_ID_LEN);
+    manifest_id_for_log[MAX_MANIFEST_ID_LEN] = '\0';
+
+    printf("  Parsed Manifest ID: '%s', Number of Segments: %u\n", 
+           manifest_id_for_log, plaintext_manifest.num_segments);
+
+    // TODO: Placeholder for actual segment processing logic using CUDA streams, etc.
+    
+    // --- POC: Input Staging Logic ---
+    typedef struct {
+        char segment_id[MAX_SEGMENT_ID_LEN]; // From manifest
+        gpu_data_masking_level_t masking_level; // From IPC descriptor
+        int direction; // From manifest (0:input, 1:output, 2:input/output)
+        char gpu_operation_id[MAX_GPU_OPERATION_ID_LEN]; // From manifest
+
+        // For staged input data
+        unsigned char* enclave_host_buffer_input; 
+        void* enclave_device_buffer_input;    
+        void* effective_gpu_input_ptr;        
+        uint32_t processed_input_data_size;
+
+        // For staging output data (to be used in later subtask)
+        void* enclave_device_buffer_output;   
+        unsigned char* enclave_host_buffer_output; 
+
+        int status; // 0 for success
+    } SegmentRuntimeInfoPoc;
+
+    SegmentRuntimeInfoPoc segment_run_info[MAX_SEGMENTS_PER_MANIFEST]; // MAX_SEGMENTS_PER_MANIFEST from shared_service.h
+    memset(segment_run_info, 0, sizeof(segment_run_info));
+
+    bool any_segment_failed = false;
+
+    for (uint32_t i = 0; i < decrypted_manifest.num_segments; ++i) {
+        workload_manifest_segment_t* manifest_seg = &decrypted_manifest.segments[i];
+        ipc_segment_descriptor_t* ipc_seg = &req->segment_descriptors[i]; // Assuming order matches
+        SegmentRuntimeInfoPoc* run_seg = &segment_run_info[i];
+
+        strncpy(run_seg->segment_id, manifest_seg->segment_id, MAX_SEGMENT_ID_LEN -1);
+        run_seg->segment_id[MAX_SEGMENT_ID_LEN-1] = '\0';
+        strncpy(run_seg->gpu_operation_id, manifest_seg->gpu_operation_id, MAX_GPU_OPERATION_ID_LEN -1);
+        run_seg->gpu_operation_id[MAX_GPU_OP_ID_LEN-1] = '\0';
+        run_seg->direction = manifest_seg->direction;
+        run_seg->masking_level = ipc_seg->masking_level; // Masking level from IPC descriptor
+        run_seg->status = 0; // Default to success for this segment
+
+        if (run_seg->direction == DATA_DIRECTION_INPUT || run_seg->direction == DATA_DIRECTION_INPUT_OUTPUT) {
+            printf("  Staging input for segment ID: %s, GPU Op ID: %s\n", run_seg->segment_id, run_seg->gpu_operation_id);
+            if (run_seg->masking_level == MASKING_AES_GCM) {
+                printf("    Staging AES-GCM input for segment %s...\n", run_seg->segment_id);
+                if (ipc_seg->encrypted_data_size == 0 || ipc_seg->encrypted_data_size > MAX_INLINE_SEGMENT_DATA_SIZE) {
+                    fprintf(stderr, "    ERROR: Invalid encrypted_data_size %u for segment %s.\n", ipc_seg->encrypted_data_size, run_seg->segment_id);
+                    run_seg->status = -EINVAL; any_segment_failed = true; continue;
+                }
+
+                run_seg->enclave_host_buffer_input = (unsigned char*)malloc(ipc_seg->encrypted_data_size);
+                if (!run_seg->enclave_host_buffer_input) {
+                    fprintf(stderr, "    ERROR: Failed to malloc enclave_host_buffer_input for segment %s.\n", run_seg->segment_id);
+                    run_seg->status = -ENOMEM; any_segment_failed = true; continue;
+                }
+
+                if (libos_aes_gcm_decrypt(g_shared_enclave_aes_key, ipc_seg->iv, ipc_seg->encrypted_data, 
+                                          ipc_seg->encrypted_data_size, ipc_seg->tag, 
+                                          run_seg->enclave_host_buffer_input, NULL, 0) != 0) {
+                    fprintf(stderr, "    ERROR: Decryption failed for segment %s.\n", run_seg->segment_id);
+                    run_seg->status = -EPERM; any_segment_failed = true; free(run_seg->enclave_host_buffer_input); run_seg->enclave_host_buffer_input = NULL; continue;
+                }
+                
+                cudaError_t cuda_err = cudaMalloc(&run_seg->enclave_device_buffer_input, ipc_seg->encrypted_data_size);
+                if (cuda_err != cudaSuccess) {
+                    fprintf(stderr, "    ERROR: cudaMalloc for enclave_device_buffer_input failed for segment %s: %s\n", run_seg->segment_id, cudaGetErrorString(cuda_err));
+                    run_seg->status = -ENOMEM; any_segment_failed = true; free(run_seg->enclave_host_buffer_input); run_seg->enclave_host_buffer_input = NULL; continue;
+                }
+
+                cuda_err = cudaMemcpy(run_seg->enclave_device_buffer_input, run_seg->enclave_host_buffer_input, ipc_seg->encrypted_data_size, cudaMemcpyHostToDevice);
+                if (cuda_err != cudaSuccess) {
+                    fprintf(stderr, "    ERROR: cudaMemcpy HtoD failed for segment %s: %s\n", run_seg->segment_id, cudaGetErrorString(cuda_err));
+                    run_seg->status = -EIO; any_segment_failed = true; cudaFree(run_seg->enclave_device_buffer_input); run_seg->enclave_device_buffer_input = NULL; free(run_seg->enclave_host_buffer_input); run_seg->enclave_host_buffer_input = NULL; continue;
+                }
+                run_seg->effective_gpu_input_ptr = run_seg->enclave_device_buffer_input;
+                run_seg->processed_input_data_size = ipc_seg->encrypted_data_size; // Plaintext size is same as ciphertext for AES-GCM
+                printf("    AES-GCM Input segment %s staged successfully to device memory %p, size %u.\n", run_seg->segment_id, run_seg->effective_gpu_input_ptr, run_seg->processed_input_data_size);
+
+            } else if (run_seg->masking_level == MASKING_NONE) { // DMA input path
+                printf("    Staging MASKING_NONE input for segment %s...\n", run_seg->segment_id);
+                run_seg->processed_input_data_size = ipc_seg->input_data_size;
+                if (ipc_seg->src_device_ptr == 0) {
+                    fprintf(stderr, "    ERROR: src_device_ptr is NULL for DMA segment %s.\n", run_seg->segment_id);
+                    run_seg->status = -EINVAL; any_segment_failed = true; continue;
+                }
+                // TODO: SECURITY - Implement robust DMA input pointer validation.
+                // This is a placeholder for where more advanced checks would go.
+                // For POC, we're trusting the client's pointer if it's not NULL.
+                run_seg->effective_gpu_input_ptr = (void*)ipc_seg->src_device_ptr;
+                printf("    MASKING_NONE Input segment %s staged (using client device_ptr %p, size %u).\n", run_seg->segment_id, run_seg->effective_gpu_input_ptr, run_seg->processed_input_data_size);
+            }
+        }
+    }
+    printf("  SHARED_SERVICE_BATCH_LOG: Input staging phase complete.\n");
+    printf("  SHARED_SERVICE_BATCH_LOG: TODO: Implement GPU operation dispatch using CUDA streams based on gpu_operation_id.\n");
+    printf("  SHARED_SERVICE_BATCH_LOG: TODO: Implement output finalization (encryption/DMA setup for output segments).\n");
+    printf("  SHARED_SERVICE_BATCH_LOG: TODO: Implement robust error handling and resource management per segment.\n");
+
+    // Populate dummy response based on new segment_run_info
+    resp->num_segments = decrypted_manifest.num_segments; 
+    for (uint32_t i = 0; i < decrypted_manifest.num_segments; ++i) {
+        strncpy(resp->segments[i].segment_id, segment_run_info[i].segment_id, MAX_SEGMENT_ID_LEN -1);
+        resp->segments[i].segment_id[MAX_SEGMENT_ID_LEN-1] = '\0';
+        resp->segments[i].status = segment_run_info[i].status; // Reflect staging status for now
+        
+        // For output segments, set dummy actual_output_data_size for POC
+        if (segment_run_info[i].direction == DATA_DIRECTION_OUTPUT || segment_run_info[i].direction == DATA_DIRECTION_INPUT_OUTPUT) {
+             if (segment_run_info[i].masking_level == MASKING_AES_GCM) {
+                resp->segments[i].actual_output_data_size = MAX_INLINE_SEGMENT_DATA_SIZE / 2; // Dummy
+                resp->segments[i].encrypted_data_size = resp->segments[i].actual_output_data_size;
+                generate_iv_for_response(resp->segments[i].iv, GCM_IV_SIZE_BYTES);
+                memset(resp->segments[i].tag, 0xBC, GCM_TAG_SIZE_BYTES); 
+             } else { // MASKING_NONE
+                resp->segments[i].actual_output_data_size = decrypted_manifest.segments[i].client_dma_output_buffer_size > 0 ? decrypted_manifest.segments[i].client_dma_output_buffer_size : 32;
+                resp->segments[i].encrypted_data_size = 0; // No data in payload for DMA output
+             }
+        } else {
+            resp->segments[i].actual_output_data_size = 0;
+            resp->segments[i].encrypted_data_size = 0;
+        }
+    }
+
+    if (any_segment_failed) {
+        resp->overall_batch_status = -EBADMSG; // Indicate one or more segments failed
+    } else {
+        resp->overall_batch_status = 0; // Mark as success for now (basic parsing and input staging done)
+    }
+
+    // POC Cleanup for allocated input buffers
+    for (uint32_t i = 0; i < decrypted_manifest.num_segments; ++i) {
+        if (segment_run_info[i].enclave_host_buffer_input) {
+            free(segment_run_info[i].enclave_host_buffer_input);
+        }
+        if (segment_run_info[i].masking_level == MASKING_AES_GCM && segment_run_info[i].enclave_device_buffer_input) {
+            // Only free if it's an enclave allocated buffer for AES-GCM path.
+            // DMA path uses client's pointer, not freed by service.
+            cudaFree(segment_run_info[i].enclave_device_buffer_input);
+        }
+    }
+
+    printf("SHARED_SERVICE_LOG: Finished basic handling of BATCH_GPU_REQUEST with overall status %d.\n", resp->overall_batch_status);
+}
+
+
+// --- IPC Server Functions using PAL ---
 
 
 // --- IPC Server Functions using PAL ---
@@ -604,6 +898,16 @@ void handle_client_session(PAL_HANDLE client_handle, IDTYPE client_vmid) {
             handle_gemm_request((gemm_request_payload_t*)req_msg->data, &gemm_resp);
             init_ipc_msg(resp_msg, GEMM_REQUEST, sizeof(libos_ipc_msg_header_t) + sizeof(gemm_resp));
             memcpy(resp_msg->data, &gemm_resp, sizeof(gemm_resp));
+            ret = ipc_send_raw_response_to_client(client_handle, resp_msg, GET_UNALIGNED(resp_msg->header.size));
+        } else if (op_type == BATCH_GPU_REQUEST) { // Using non-POC enum BATCH_GPU_REQUEST
+            if (payload_sz != sizeof(batch_gpu_request_payload_t)) { // Using non-POC struct
+                fprintf(stderr, "SHARED_SERVICE_ERROR: BATCH_GPU_REQUEST payload size mismatch (got %zu, expected %zu).\n", payload_sz, sizeof(batch_gpu_request_payload_t));
+                break; 
+            }
+            batch_gpu_response_payload_t batch_resp; memset(&batch_resp, 0, sizeof(batch_resp)); // non-POC struct
+            handle_batch_gpu_request((batch_gpu_request_payload_t*)req_msg->data, &batch_resp); // non-POC struct
+            init_ipc_msg(resp_msg, BATCH_GPU_REQUEST, sizeof(libos_ipc_msg_header_t) + sizeof(batch_resp));
+            memcpy(resp_msg->data, &batch_resp, sizeof(batch_resp));
             ret = ipc_send_raw_response_to_client(client_handle, resp_msg, GET_UNALIGNED(resp_msg->header.size));
         } else if (op_type == STORE_DATA || op_type == RETRIEVE_DATA) {
             if (payload_sz > sizeof(legacy_data_request_t)) { break; }

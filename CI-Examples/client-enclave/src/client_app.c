@@ -82,9 +82,9 @@ int main(int argc, char *argv[]) {
 
     float *h_B = NULL;
     float *h_C = NULL;
-    // h_A_expected and h_A_result can remain stack/heap allocated as they are for client-side verification
+    float *h_A_result = NULL; // Will be dynamically allocated
+    // h_A_expected can remain stack-allocated as it's purely for client-side verification
     float h_A_expected[num_elements]; 
-    float h_A_result[num_elements];
 
     uint64_t d_ptr_B = 0;
     uint64_t d_ptr_C = 0;
@@ -118,6 +118,24 @@ int main(int argc, char *argv[]) {
     for (int i = 0; i < num_elements; ++i) {
         h_A_expected[i] = h_B[i] + h_C[i];
     }
+
+    // Allocate h_A_result based on masking level BEFORE preparing request
+    if (current_masking_level == MASKING_NONE) {
+        printf("CLIENT_APP_LOG: Allocating page-locked (pinned) host memory for h_A_result using cudaHostAlloc...\n");
+        CUDA_CHECK(cudaHostAlloc((void**)&h_A_result, data_size_bytes, cudaHostAllocDefault));
+        if (!h_A_result) {
+            fprintf(stderr, "CLIENT_APP_ERROR: cudaHostAlloc failed for h_A_result.\n");
+            // Go to cleanup that handles h_B and h_C
+            goto cleanup_va_pre_ipc;
+        }
+    } else { // MASKING_AES_GCM
+        h_A_result = (float*)malloc(data_size_bytes);
+        if (!h_A_result) {
+            fprintf(stderr, "CLIENT_APP_ERROR: Failed to allocate memory for h_A_result (AES-GCM).\n");
+            // Go to cleanup that handles h_B and h_C
+            goto cleanup_va_pre_ipc;
+        }
+    }
     // print_float_array("Host B (plaintext)", h_B, num_elements);
     // print_float_array("Host C (plaintext)", h_C, num_elements);
     // print_float_array("Host A_expected (plaintext)", h_A_expected, num_elements);
@@ -125,7 +143,7 @@ int main(int argc, char *argv[]) {
 
     // 2. Prepare request payload
     vector_add_request_payload_t request_payload;
-    memset(&request_payload, 0, sizeof(request_payload)); // Important to zero out, especially for DMA pointers
+    memset(&request_payload, 0, sizeof(request_payload)); // Important to zero out
     request_payload.array_len_elements = num_elements;
     request_payload.masking_level = current_masking_level;
     int ret;
@@ -133,30 +151,40 @@ int main(int argc, char *argv[]) {
 
     if (current_masking_level == MASKING_AES_GCM) {
         printf("CLIENT_APP_LOG: Encrypting input arrays B and C using AES-GCM...\n");
-        request_payload.src_device_ptr_b = 0; // Not using DMA
-        request_payload.src_device_ptr_c = 0; // Not using DMA
+        request_payload.src_device_ptr_b = 0; 
+        request_payload.src_device_ptr_c = 0; 
+        request_payload.dest_host_ptr_a = 0; // No DMA for output in AES-GCM
+        request_payload.dest_host_buffer_size_a = 0;
         generate_iv(request_payload.iv_b, GCM_IV_SIZE_BYTES);
         ret = libos_aes_gcm_encrypt(aes_key, request_payload.iv_b,
                                     (const unsigned char*)h_B, data_size_bytes,
                                     request_payload.data_b, request_payload.tag_b, NULL, 0);
-        if (ret != 0) { fprintf(stderr, "CLIENT_APP_ERROR: Encryption of array B failed: %d\n", ret); return EXIT_FAILURE; }
+        if (ret != 0) { fprintf(stderr, "CLIENT_APP_ERROR: Encryption of array B failed: %d\n", ret); goto cleanup_va_pre_ipc; }
 
         generate_iv(request_payload.iv_c, GCM_IV_SIZE_BYTES);
         ret = libos_aes_gcm_encrypt(aes_key, request_payload.iv_c,
                                     (const unsigned char*)h_C, data_size_bytes,
                                     request_payload.data_c, request_payload.tag_c, NULL, 0);
-        if (ret != 0) { fprintf(stderr, "CLIENT_APP_ERROR: Encryption of array C failed: %d\n", ret); return EXIT_FAILURE; }
+        if (ret != 0) { fprintf(stderr, "CLIENT_APP_ERROR: Encryption of array C failed: %d\n", ret); goto cleanup_va_pre_ipc; }
     } else { // MASKING_NONE
-        printf("CLIENT_APP_LOG: Preparing input arrays B and C as plaintext...\n");
-        memcpy(request_payload.data_b, h_B, data_size_bytes);
-        memcpy(request_payload.data_c, h_C, data_size_bytes);
-        // IV and Tag fields are left zeroed/uninitialized as they are not used for data arrays.
-        // src_device_ptr_b and src_device_ptr_c are explicitly set.
+        printf("CLIENT_APP_LOG: Preparing input arrays B and C as plaintext for DMA...\n");
+        // Data for B and C is already in pinned h_B, h_C. Service will use device pointers.
+        // No need to memcpy to request_payload.data_b/c if service only uses device_ptrs.
+        // However, current service logic might still expect data_b/c if ptrs are zero for some reason,
+        // but for this DMA path, we assume device_ptrs are primary.
+        // Let's clear them to avoid confusion if service logic changes.
+        // memset(request_payload.data_b, 0, sizeof(request_payload.data_b));
+        // memset(request_payload.data_c, 0, sizeof(request_payload.data_c));
+
         request_payload.src_device_ptr_b = d_ptr_B;
         request_payload.src_device_ptr_c = d_ptr_C;
-        printf("CLIENT_APP_LOG: Using DMA path. Device pointers set in request.\n");
-        // data_b and data_c fields in payload are not used by service if device_ptrs are set.
-        // No need to zero them explicitly here if memset covered the whole struct earlier.
+        printf("CLIENT_APP_LOG: Using DMA path for input. Device pointers set in request.\n");
+
+        // Set DMA output pointers
+        request_payload.dest_host_ptr_a = (uint64_t)h_A_result;
+        request_payload.dest_host_buffer_size_a = data_size_bytes;
+        printf("CLIENT_APP_LOG: Using DMA path for output. Dest host pointer 0x%lx, size %u set in request.\n",
+               request_payload.dest_host_ptr_a, request_payload.dest_host_buffer_size_a);
     }
 
     // 3. Prepare IPC message
@@ -204,58 +232,66 @@ int main(int argc, char *argv[]) {
     // Check response message code and size
     if (GET_UNALIGNED(response_msg_ptr->header.code) != VECTOR_ADD_REQUEST) { // Or a new RESPONSE_VECTOR_ADD type
         fprintf(stderr, "CLIENT_APP_ERROR: Received unexpected message code: %u\n", GET_UNALIGNED(response_msg_ptr->header.code));
-        free(response_msg_ptr);
-        return EXIT_FAILURE;
+        ret = EXIT_FAILURE; goto cleanup_va_post_ipc;
     }
     // Expected size: header + specific payload
     size_t expected_resp_payload_size = sizeof(vector_add_response_payload_t);
     if (GET_UNALIGNED(response_msg_ptr->header.size) != (sizeof(libos_ipc_msg_header_t) + expected_resp_payload_size)) {
          fprintf(stderr, "CLIENT_APP_ERROR: Received message with unexpected size: %lu (expected payload %zu)\n",
                  GET_UNALIGNED(response_msg_ptr->header.size) - sizeof(libos_ipc_msg_header_t), expected_resp_payload_size);
-        free(response_msg_ptr);
-        return EXIT_FAILURE;
+        ret = EXIT_FAILURE; goto cleanup_va_post_ipc;
     }
 
     vector_add_response_payload_t* response_payload = (vector_add_response_payload_t*)response_msg_ptr->data;
 
     if (response_payload->status != 0) {
         fprintf(stderr, "CLIENT_APP_ERROR: Shared enclave reported error: %d\n", response_payload->status);
-        free(response_msg_ptr);
-        return EXIT_FAILURE;
+        ret = EXIT_FAILURE; goto cleanup_va_post_ipc;
     }
     if (response_payload->array_len_elements != num_elements) {
         fprintf(stderr, "CLIENT_APP_ERROR: Response array length mismatch. Expected %d, Got %u\n",
                 num_elements, response_payload->array_len_elements);
-        free(response_msg_ptr);
-        return EXIT_FAILURE;
+        ret = EXIT_FAILURE; goto cleanup_va_post_ipc;
     }
 
     // Check response masking level
     if (response_payload->masking_level != current_masking_level) {
         fprintf(stderr, "CLIENT_APP_WARNING: Masking level mismatch between request (%d) and response (%d).\n",
                 current_masking_level, response_payload->masking_level);
-        // Decide if this is a fatal error or just a warning. For now, proceed.
     }
 
     if (response_payload->masking_level == MASKING_AES_GCM) {
-        printf("CLIENT_APP_LOG: Decrypting result array A (AES-GCM)...\n");
+        printf("CLIENT_APP_LOG: Decrypting result array A (AES-GCM) into malloc'd h_A_result...\n");
         ret = libos_aes_gcm_decrypt(aes_key, response_payload->iv_a,
                                     response_payload->data_a, data_size_bytes,
                                     response_payload->tag_a, (unsigned char*)h_A_result,
                                     NULL, 0); 
         if (ret != 0) {
             fprintf(stderr, "CLIENT_APP_ERROR: Decryption of result array A failed: %d\n", ret);
-            free(response_msg_ptr);
-            return EXIT_FAILURE;
+            ret = EXIT_FAILURE; goto cleanup_va_post_ipc;
         }
     } else { // MASKING_NONE
-        printf("CLIENT_APP_LOG: Received result array A as plaintext.\n");
-        memcpy(h_A_result, response_payload->data_a, data_size_bytes);
+        // If DMA for output was used (dest_host_ptr_a was set), data is already in h_A_result.
+        // If DMA for output was NOT used by service (e.g. service older version or error),
+        // then we would need to copy from response_payload->data_a.
+        // For this version, we assume if client sets dest_host_ptr_a and masking is NONE,
+        // the service uses DMA or fails the call. So, no memcpy needed here.
+        if (request_payload.dest_host_ptr_a != 0) {
+            printf("CLIENT_APP_LOG: Result array A received via DMA into pinned h_A_result.\n");
+            // CUDA stream synchronization would happen here if the service used a specific stream
+            // for the DtoH copy and client needed to wait on it. For now, assuming service syncs.
+        } else {
+            // This case should ideally not happen if service honors DMA output request.
+            // If it does, it means service ignored DMA output and sent data in payload.
+            printf("CLIENT_APP_LOG: Result array A received as plaintext in payload. Copying...\n");
+            memcpy(h_A_result, response_payload->data_a, data_size_bytes);
+        }
     }
     // print_float_array("Host A_result (processed)", h_A_result, num_elements);
 
     // 6. Verify Result
     printf("CLIENT_APP_LOG: Verifying results...\n");
+    ret = EXIT_SUCCESS; // Assume success unless mismatches found
     int mismatches = 0;
     for (int i = 0; i < num_elements; ++i) {
         if (fabs(h_A_result[i] - h_A_expected[i]) > 1e-5) { // Tolerance for float comparison
@@ -271,25 +307,55 @@ int main(int argc, char *argv[]) {
         printf("CLIENT_APP_SUCCESS: Vector addition results verified successfully!\n");
     } else {
         fprintf(stderr, "CLIENT_APP_FAILURE: %d mismatches found in vector addition results.\n", mismatches);
-        free(response_msg_ptr);
-        return EXIT_FAILURE;
+        ret = EXIT_FAILURE;
+        // Fall through to cleanup
     }
 
-    // 7. Cleanup
-    free(response_msg_ptr); // ipc_send_msg_and_get_response allocates this
+cleanup_va_post_ipc:
+    if (response_msg_ptr) free(response_msg_ptr);
+
+cleanup_va_pre_ipc: // Label for cleanup if error occurs before IPC call but after allocations
+    if (h_A_result) {
+        if (current_masking_level == MASKING_NONE) {
+            printf("CLIENT_APP_LOG: Freeing page-locked (pinned) host memory for h_A_result using cudaFreeHost...\n");
+            cudaError_t free_err = cudaFreeHost(h_A_result); // Changed from CUDA_CHECK for cleanup path
+            if (free_err != cudaSuccess) {
+                 fprintf(stderr, "CUDA_ERROR (cleanup): cudaFreeHost(h_A_result) failed: %s\n", cudaGetErrorString(free_err));
+                 if (ret == EXIT_SUCCESS) ret = EXIT_FAILURE; // Ensure error is propagated
+            }
+        } else {
+            free(h_A_result);
+        }
+        h_A_result = NULL;
+    }
 
     if (current_masking_level == MASKING_NONE) {
         printf("CLIENT_APP_LOG: Freeing page-locked (pinned) host memory for B and C using cudaFreeHost...\n");
-        if (h_B) CUDA_CHECK(cudaFreeHost(h_B));
-        if (h_C) CUDA_CHECK(cudaFreeHost(h_C));
+        if (h_B) { 
+            cudaError_t free_err = cudaFreeHost(h_B); 
+            if (free_err != cudaSuccess) {
+                 fprintf(stderr, "CUDA_ERROR (cleanup): cudaFreeHost(h_B) failed: %s\n", cudaGetErrorString(free_err));
+                 if (ret == EXIT_SUCCESS) ret = EXIT_FAILURE;
+            }
+        }
+        if (h_C) {
+            cudaError_t free_err = cudaFreeHost(h_C);
+            if (free_err != cudaSuccess) {
+                 fprintf(stderr, "CUDA_ERROR (cleanup): cudaFreeHost(h_C) failed: %s\n", cudaGetErrorString(free_err));
+                 if (ret == EXIT_SUCCESS) ret = EXIT_FAILURE;
+            }
+        }
     } else { // MASKING_AES_GCM
         if (h_B) free(h_B);
         if (h_C) free(h_C);
     }
-    h_B = NULL; // Avoid double free if error occurred before full success
+    h_B = NULL; 
     h_C = NULL;
 
-    printf("CLIENT_APP_LOG: Client application finished successfully.\n");
-
-    return EXIT_SUCCESS;
+    if (ret == EXIT_SUCCESS) {
+        printf("CLIENT_APP_LOG: Client application finished successfully.\n");
+    } else {
+        printf("CLIENT_APP_LOG: Client application finished with errors.\n");
+    }
+    return ret;
 }

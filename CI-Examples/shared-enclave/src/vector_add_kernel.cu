@@ -14,12 +14,14 @@ __global__ void vectorAddKernel(float *a, const float *b, const float *c, int n)
 
 // C-callable wrapper function to launch the CUDA kernel
 extern "C" int launch_vector_add_cuda(
-    float* h_A_out, 
-    const float* h_B_in, // Host pointer, used if not DMA for B
-    const float* h_C_in, // Host pointer, used if not DMA for C
+    bool use_dma_for_output_a,       // New: Flag to indicate if DMA output to client host is used
+    uint64_t dest_client_host_ptr_a, // New: Client-provided host pointer for output A (if DMA)
+    float* h_A_out_fallback,         // Existing h_A_out, now a fallback if DMA output is not used
+    const float* h_B_in, 
+    const float* h_C_in, 
     int n,
-    int* cuda_error_code,       // Output CUDA error code
-    const char** cuda_error_str,  // Output CUDA error string pointer
+    int* cuda_error_code,
+    const char** cuda_error_str,
     bool use_dma_for_b,
     uint64_t d_ptr_b_client,
     bool use_dma_for_c,
@@ -118,13 +120,25 @@ extern "C" int launch_vector_add_cuda(
         goto Error;
     }
 
-    // Copy the result array from device to host
-    err = cudaMemcpy(h_A_out, d_A, n * sizeof(float), cudaMemcpyDeviceToHost);
-    if (err != cudaSuccess) {
-        if (cuda_error_code) *cuda_error_code = err;
-        if (cuda_error_str) *cuda_error_str = cudaGetErrorString(err);
-        fprintf(stderr, "CUDA_WRAPPER: Failed to copy d_A to h_A_out: %s\n", cudaGetErrorString(err));
-        goto Error;
+    // Copy the result array from device (d_A) to the appropriate host destination
+    if (use_dma_for_output_a) {
+        printf("CUDA_WRAPPER: Copying result d_A to client's host pointer 0x%lx via DMA.\n", dest_client_host_ptr_a);
+        err = cudaMemcpy((void*)dest_client_host_ptr_a, d_A, n * sizeof(float), cudaMemcpyDeviceToHost);
+        if (err != cudaSuccess) {
+            if (cuda_error_code) *cuda_error_code = err;
+            if (cuda_error_str) *cuda_error_str = cudaGetErrorString(err);
+            fprintf(stderr, "CUDA_WRAPPER: Failed to copy d_A to client's host pointer (dest_client_host_ptr_a): %s\n", cudaGetErrorString(err));
+            goto Error;
+        }
+    } else {
+        printf("CUDA_WRAPPER: Copying result d_A to fallback host buffer h_A_out_fallback.\n");
+        err = cudaMemcpy(h_A_out_fallback, d_A, n * sizeof(float), cudaMemcpyDeviceToHost);
+        if (err != cudaSuccess) {
+            if (cuda_error_code) *cuda_error_code = err;
+            if (cuda_error_str) *cuda_error_str = cudaGetErrorString(err);
+            fprintf(stderr, "CUDA_WRAPPER: Failed to copy d_A to h_A_out_fallback: %s\n", cudaGetErrorString(err));
+            goto Error;
+        }
     }
 
     // Free GPU memory

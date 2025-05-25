@@ -116,8 +116,11 @@ int main(int argc, char *argv[]) {
     assert(input_tensor_size_bytes <= MAX_ONNX_INPUT_SIZE_BYTES);
 
     float* input_tensor_plaintext = NULL;
+    unsigned char* output_tensor_plaintext = NULL; // For storing results from service
     uint64_t d_ptr_input_tensor = 0;
+    int ret = EXIT_SUCCESS; // Default to success
 
+    // Allocate input tensor memory
     if (current_masking_level == MASKING_NONE) {
         printf("CLIENT_APP_ONNX_LOG: Allocating page-locked (pinned) host memory for input_tensor_plaintext using cudaHostAlloc...\n");
         CUDA_CHECK(cudaHostAlloc((void**)&input_tensor_plaintext, input_tensor_size_bytes, cudaHostAllocDefault));
@@ -125,11 +128,19 @@ int main(int argc, char *argv[]) {
         printf("CLIENT_APP_ONNX_LOG: Getting device pointer for input_tensor_plaintext...\n");
         CUDA_CHECK(cudaHostGetDevicePointer((void**)&d_ptr_input_tensor, (void*)input_tensor_plaintext, 0));
         printf("CLIENT_APP_ONNX_LOG: Device pointer for input_tensor_plaintext: 0x%lx\n", d_ptr_input_tensor);
+
+        printf("CLIENT_APP_ONNX_LOG: Allocating page-locked (pinned) host memory for output_tensor_plaintext using cudaHostAlloc...\n");
+        CUDA_CHECK(cudaHostAlloc((void**)&output_tensor_plaintext, MAX_ONNX_OUTPUT_SIZE_BYTES, cudaHostAllocDefault));
     } else { // MASKING_AES_GCM
         input_tensor_plaintext = (float*)malloc(input_tensor_size_bytes);
         if (!input_tensor_plaintext) {
-            fprintf(stderr, "CLIENT_APP_ONNX_ERROR: Failed to allocate memory for input tensor.\n");
-            return EXIT_FAILURE;
+            fprintf(stderr, "CLIENT_APP_ONNX_ERROR: Failed to malloc memory for input tensor.\n");
+            ret = EXIT_FAILURE; goto cleanup_onnx;
+        }
+        output_tensor_plaintext = (unsigned char*)malloc(MAX_ONNX_OUTPUT_SIZE_BYTES);
+        if (!output_tensor_plaintext) {
+            fprintf(stderr, "CLIENT_APP_ONNX_ERROR: Failed to malloc memory for output tensor.\n");
+            ret = EXIT_FAILURE; goto cleanup_onnx;
         }
     }
 
@@ -139,39 +150,35 @@ int main(int argc, char *argv[]) {
 
     // 2. Prepare request payload
     onnx_inference_request_payload_t request_payload;
-    memset(&request_payload, 0, sizeof(request_payload)); // Important to zero out, especially for DMA pointers
+    memset(&request_payload, 0, sizeof(request_payload)); 
     request_payload.input_tensor_size_bytes = input_tensor_size_bytes;
-    // Optional: Populate model_name if service uses it (not used in this example's service)
-    // strncpy(request_payload.model_name, "mobilenetv2-7.onnx", MAX_MODEL_NAME_LEN -1);
-
     request_payload.masking_level = current_masking_level;
-    int ret;
 
     if (current_masking_level == MASKING_AES_GCM) {
         printf("CLIENT_APP_ONNX_LOG: Encrypting input tensor using AES-GCM...\n");
-        request_payload.src_device_ptr_input_tensor = 0; // Not using DMA
+        request_payload.src_device_ptr_input_tensor = 0; 
+        request_payload.dest_host_ptr_output = 0; // No DMA for output in AES-GCM
+        request_payload.dest_host_buffer_size_output = 0;
         generate_iv(request_payload.iv, GCM_IV_SIZE_BYTES);
-        ret = libos_aes_gcm_encrypt(aes_key, request_payload.iv,
-                                        (const unsigned char*)input_tensor_plaintext,
-                                        input_tensor_size_bytes,
-                                        request_payload.input_tensor, // Changed from masked_input_tensor
-                                        request_payload.tag,
-                                        NULL, 0); 
-        if (ret != 0) {
-            fprintf(stderr, "CLIENT_APP_ONNX_ERROR: Encryption of input tensor failed: %d\n", ret);
-            // free(input_tensor_plaintext) will be handled in cleanup section
-            return EXIT_FAILURE; // Consider more robust cleanup if other resources were allocated
+        if (libos_aes_gcm_encrypt(aes_key, request_payload.iv,
+                                  (const unsigned char*)input_tensor_plaintext,
+                                  input_tensor_size_bytes,
+                                  request_payload.input_tensor, 
+                                  request_payload.tag,
+                                  NULL, 0) != 0) {
+            fprintf(stderr, "CLIENT_APP_ONNX_ERROR: Encryption of input tensor failed.\n");
+            ret = EXIT_FAILURE; goto cleanup_onnx;
         }
     } else { // MASKING_NONE
         printf("CLIENT_APP_ONNX_LOG: Preparing input tensor for DMA path...\n");
-        // For DMA, data is not copied into request_payload.input_tensor.
-        // The service will use src_device_ptr_input_tensor to access it directly.
         request_payload.src_device_ptr_input_tensor = d_ptr_input_tensor;
-        printf("CLIENT_APP_ONNX_LOG: Using DMA path. Device pointer set in request.\n");
-        // request_payload.input_tensor field is not used by service if device_ptr is set.
+        printf("CLIENT_APP_ONNX_LOG: Using DMA path for input. Device pointer 0x%lx set in request.\n", d_ptr_input_tensor);
+        
+        request_payload.dest_host_ptr_output = (uint64_t)output_tensor_plaintext;
+        request_payload.dest_host_buffer_size_output = MAX_ONNX_OUTPUT_SIZE_BYTES;
+        printf("CLIENT_APP_ONNX_LOG: Using DMA path for output. Dest host pointer 0x%lx, size %u set in request.\n",
+               request_payload.dest_host_ptr_output, request_payload.dest_host_buffer_size_output);
     }
-    // NOTE: The free(input_tensor_plaintext) that was here is moved to the main cleanup section
-    // because for DMA, the buffer must remain valid until the service is done.
 
     // 3. Prepare IPC message
     struct libos_ipc_msg request_msg;
@@ -200,47 +207,39 @@ int main(int argc, char *argv[]) {
 
     if (ret < 0) {
         fprintf(stderr, "CLIENT_APP_ONNX_ERROR: ipc_send_msg_and_get_response failed: %s\n", unix_strerror(ret));
-        return EXIT_FAILURE;
+        ret = EXIT_FAILURE; goto cleanup_onnx;
     }
     if (!response_msg_ptr) {
         fprintf(stderr, "CLIENT_APP_ONNX_ERROR: Received NULL response_msg_ptr from IPC.\n");
-        return EXIT_FAILURE;
+        ret = EXIT_FAILURE; goto cleanup_onnx;
     }
     printf("CLIENT_APP_ONNX_LOG: Received response from shared enclave. End-to-end time: %.4f seconds\n", cpu_time_used);
 
     // 5. Handle Response
-    if (GET_UNALIGNED(response_msg_ptr->header.code) != ONNX_INFERENCE_REQUEST) { // Or a specific ONNX_RESPONSE code
+    if (GET_UNALIGNED(response_msg_ptr->header.code) != ONNX_INFERENCE_REQUEST) { 
         fprintf(stderr, "CLIENT_APP_ONNX_ERROR: Received unexpected message code: %u\n", GET_UNALIGNED(response_msg_ptr->header.code));
-        free(response_msg_ptr);
-        return EXIT_FAILURE;
+        ret = EXIT_FAILURE; goto cleanup_onnx;
     }
     size_t expected_resp_payload_size = sizeof(onnx_inference_response_payload_t);
     if (GET_UNALIGNED(response_msg_ptr->header.size) != (sizeof(libos_ipc_msg_header_t) + expected_resp_payload_size)) {
          fprintf(stderr, "CLIENT_APP_ONNX_ERROR: Received message with unexpected size: %lu (expected payload %zu)\n",
                  GET_UNALIGNED(response_msg_ptr->header.size) - sizeof(libos_ipc_msg_header_t), expected_resp_payload_size);
-        free(response_msg_ptr);
-        return EXIT_FAILURE;
+        ret = EXIT_FAILURE; goto cleanup_onnx;
     }
 
     onnx_inference_response_payload_t* response_payload = (onnx_inference_response_payload_t*)response_msg_ptr->data;
 
     if (response_payload->status != 0) {
         fprintf(stderr, "CLIENT_APP_ONNX_ERROR: Shared enclave reported error for ONNX inference: %d\n", response_payload->status);
-        free(response_msg_ptr);
-        return EXIT_FAILURE;
+        ret = EXIT_FAILURE; goto cleanup_onnx;
     }
     if (response_payload->output_tensor_size_bytes == 0 || response_payload->output_tensor_size_bytes > MAX_ONNX_OUTPUT_SIZE_BYTES) {
-        fprintf(stderr, "CLIENT_APP_ONNX_ERROR: Invalid output tensor size from service: %u\n", response_payload->output_tensor_size_bytes);
-        free(response_msg_ptr);
-        return EXIT_FAILURE;
+        fprintf(stderr, "CLIENT_APP_ONNX_ERROR: Invalid output tensor size from service: %u (max allowed %d)\n", 
+                response_payload->output_tensor_size_bytes, MAX_ONNX_OUTPUT_SIZE_BYTES);
+        ret = EXIT_FAILURE; goto cleanup_onnx;
     }
     
-    float* output_tensor_plaintext = (float*)malloc(response_payload->output_tensor_size_bytes);
-    if (!output_tensor_plaintext) {
-        fprintf(stderr, "CLIENT_APP_ONNX_ERROR: Failed to allocate memory for output tensor.\n");
-        free(response_msg_ptr);
-        return EXIT_FAILURE;
-    }
+    // output_tensor_plaintext is already allocated before the IPC call
 
     if (response_payload->masking_level != current_masking_level) {
          fprintf(stderr, "CLIENT_APP_ONNX_WARNING: Masking level mismatch between request (%d) and response (%d).\n",
@@ -248,40 +247,54 @@ int main(int argc, char *argv[]) {
     }
 
     if (response_payload->masking_level == MASKING_AES_GCM) {
-        printf("CLIENT_APP_ONNX_LOG: Decrypting output tensor (%u bytes) using AES-GCM...\n", response_payload->output_tensor_size_bytes);
-        ret = libos_aes_gcm_decrypt(aes_key, response_payload->iv,
-                                    response_payload->output_tensor, // Changed from masked_output_tensor
-                                    response_payload->output_tensor_size_bytes,
-                                    response_payload->tag,
-                                    (unsigned char*)output_tensor_plaintext,
-                                    NULL, 0); 
-        if (ret != 0) {
-            fprintf(stderr, "CLIENT_APP_ONNX_ERROR: Decryption of output tensor failed: %d\n", ret);
-            free(output_tensor_plaintext);
-            free(response_msg_ptr);
-            return EXIT_FAILURE;
+        printf("CLIENT_APP_ONNX_LOG: Decrypting output tensor (%u bytes) using AES-GCM into malloc'd buffer...\n", response_payload->output_tensor_size_bytes);
+        if (libos_aes_gcm_decrypt(aes_key, response_payload->iv,
+                                  response_payload->output_tensor, 
+                                  response_payload->output_tensor_size_bytes, // Use actual size from response
+                                  response_payload->tag,
+                                  output_tensor_plaintext, // Already allocated
+                                  NULL, 0) != 0) {
+            fprintf(stderr, "CLIENT_APP_ONNX_ERROR: Decryption of output tensor failed.\n");
+            ret = EXIT_FAILURE; goto cleanup_onnx;
         }
     } else { // MASKING_NONE
-        printf("CLIENT_APP_ONNX_LOG: Received output tensor as plaintext (%u bytes).\n", response_payload->output_tensor_size_bytes);
-        memcpy(output_tensor_plaintext, response_payload->output_tensor, response_payload->output_tensor_size_bytes);
+        if (request_payload.dest_host_ptr_output != 0) {
+             printf("CLIENT_APP_ONNX_LOG: Output tensor (%u bytes) received via DMA into pinned host memory.\n", response_payload->output_tensor_size_bytes);
+             // Data is already in output_tensor_plaintext. No memcpy needed.
+             // Ensure subsequent processing uses response_payload->output_tensor_size_bytes.
+        } else {
+            // This case implies service did not use DMA for output, sent data in payload
+            printf("CLIENT_APP_ONNX_LOG: Output tensor (%u bytes) received as plaintext in payload. Copying...\n", response_payload->output_tensor_size_bytes);
+            memcpy(output_tensor_plaintext, response_payload->output_tensor, response_payload->output_tensor_size_bytes);
+        }
     }
 
     // 6. Verification (Print Top-K classes)
+    // Use response_payload->output_tensor_size_bytes for actual data length
     uint32_t num_output_elements = response_payload->output_tensor_size_bytes / sizeof(float);
     printf("CLIENT_APP_ONNX_LOG: ONNX Inference successful. Output tensor has %u elements.\n", num_output_elements);
-    if (num_output_elements == ONNX_MODEL_OUTPUT_CLASSES) { // Assuming MobileNetV2 output
-        print_top_k_classes(output_tensor_plaintext, num_output_elements, 5);
+    if (num_output_elements > 0 && num_output_elements <= (MAX_ONNX_OUTPUT_SIZE_BYTES / sizeof(float))) {
+        if (num_output_elements == ONNX_MODEL_OUTPUT_CLASSES) { 
+            print_top_k_classes((float*)output_tensor_plaintext, num_output_elements, 5);
+        } else {
+            printf("CLIENT_APP_ONNX_LOG: Output tensor has %u elements, not printing classes (expected %d for MobileNetV2 classification).\n",
+                   num_output_elements, ONNX_MODEL_OUTPUT_CLASSES);
+        }
     } else {
-        printf("CLIENT_APP_ONNX_LOG: Output tensor has %u elements, not printing classes (expected %d for MobileNetV2).\n",
-               num_output_elements, ONNX_MODEL_OUTPUT_CLASSES);
+        fprintf(stderr, "CLIENT_APP_ONNX_ERROR: Invalid number of output elements calculated: %u\n", num_output_elements);
     }
     
+cleanup_onnx:
     // 7. Cleanup
     if (input_tensor_plaintext) {
         if (current_masking_level == MASKING_NONE) {
             printf("CLIENT_APP_ONNX_LOG: Freeing page-locked (pinned) host memory for input_tensor_plaintext using cudaFreeHost...\n");
-            CUDA_CHECK(cudaFreeHost(input_tensor_plaintext));
-        } else { // MASKING_AES_GCM
+            cudaError_t free_err = cudaFreeHost(input_tensor_plaintext);
+            if (free_err != cudaSuccess) {
+                 fprintf(stderr, "CUDA_ERROR (cleanup): cudaFreeHost(input_tensor_plaintext) failed: %s\n", cudaGetErrorString(free_err));
+                 if (ret == EXIT_SUCCESS) ret = EXIT_FAILURE;
+            }
+        } else { 
             printf("CLIENT_APP_ONNX_LOG: Freeing host memory for input_tensor_plaintext using free()...\n");
             free(input_tensor_plaintext);
         }
@@ -289,14 +302,28 @@ int main(int argc, char *argv[]) {
     }
 
     if (output_tensor_plaintext) {
-        free(output_tensor_plaintext);
+        if (current_masking_level == MASKING_NONE) {
+            printf("CLIENT_APP_ONNX_LOG: Freeing page-locked (pinned) host memory for output_tensor_plaintext using cudaFreeHost...\n");
+            cudaError_t free_err = cudaFreeHost(output_tensor_plaintext);
+            if (free_err != cudaSuccess) {
+                 fprintf(stderr, "CUDA_ERROR (cleanup): cudaFreeHost(output_tensor_plaintext) failed: %s\n", cudaGetErrorString(free_err));
+                 if (ret == EXIT_SUCCESS) ret = EXIT_FAILURE;
+            }
+        } else {
+             printf("CLIENT_APP_ONNX_LOG: Freeing host memory for output_tensor_plaintext using free()...\n");
+            free(output_tensor_plaintext);
+        }
         output_tensor_plaintext = NULL;
     }
     if (response_msg_ptr) {
         free(response_msg_ptr); 
         response_msg_ptr = NULL;
     }
-    printf("CLIENT_APP_ONNX_LOG: ONNX client application finished successfully.\n");
-
-    return EXIT_SUCCESS;
+    
+    if (ret == EXIT_SUCCESS) {
+        printf("CLIENT_APP_ONNX_LOG: ONNX client application finished successfully.\n");
+    } else {
+        printf("CLIENT_APP_ONNX_LOG: ONNX client application finished with errors.\n");
+    }
+    return ret;
 }
