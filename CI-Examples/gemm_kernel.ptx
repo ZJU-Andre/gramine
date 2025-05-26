@@ -1,0 +1,52 @@
+// Minimal PTX example for: C[idx] = B[idx];
+// Kernel signature: gemm_kernel(float* A, float* B, float* C, int N)
+// A is unused here.
+.version 7.0 // Adjust as needed
+.target sm_70 // Adjust as needed
+.address_size 64
+
+.visible .entry gemm_kernel(
+    .param .u64 A_ptr,
+    .param .u64 B_ptr,
+    .param .u64 C_ptr,
+    .param .s32 N_val
+) {
+    .reg .s32 %r<4>;
+    .reg .u64 %rd<4>;
+    .reg .f32 %f<2>;
+
+    ld.param.u64 %rd0, [B_ptr];
+    ld.param.u64 %rd1, [C_ptr];
+    ld.param.s32 %r0, [N_val]; // N
+
+    // Calculate global thread ID
+    mov.u32 %r1, %ctaid.x;
+    mov.u32 %r2, %ntid.x;
+    mad.lo.s32 %r3, %r1, %r2, %tid.x; // globalIdx = blockIdx.x * blockDim.x + threadIdx.x
+
+    // Check bounds: if (globalIdx < N*N for a 1D view of N*N matrix)
+    // The PTX kernel is simplified to 1D indexing for C[idx] = B[idx]
+    // If N_val is the dimension of an NxN matrix, total elements are N*N
+    // This example assumes kernel is launched with enough threads to cover all N*N elements,
+    // e.g., gridDim.x * blockDim.x >= N*N (if 1D launch) or similar for 2D launch.
+    // For simplicity, this PTX assumes threadIdx.x maps to a unique element.
+    // A more robust GEMM would have 2D indexing (threadIdx.x, threadIdx.y, blockIdx.x, blockIdx.y).
+    // Here, %r3 is treated as a 1D index into the flattened matrix.
+    // We need to ensure we don't write out of bounds for C, which has N*N elements.
+    // The N_val param for this simplified kernel should represent total elements if used for bounds.
+    // However, the launch config (N/16*N/16 grid, 16*16 block) implies a 2D decomposition
+    // mapping to N*N threads. So %r3 as calculated will be a unique 1D global thread ID from 0 to N*N-1.
+    // No explicit N*N bound check needed here if launch dimensions are correct.
+
+    // C[globalIdx] = B[globalIdx];
+    // globalIdx is in %r3
+    mul.wide.s32 %rd2, %r3, 4; // byte offset for float (idx * sizeof(float))
+    add.u64 %rd_B_elem, %rd0, %rd2; // Address of B[globalIdx]
+    add.u64 %rd_C_elem, %rd1, %rd2; // Address of C[globalIdx]
+
+    ld.global.f32 %f0, [%rd_B_elem];
+    st.global.f32 [%rd_C_elem], %f0;
+
+DONE:
+    ret;
+}

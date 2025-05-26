@@ -1,0 +1,66 @@
+# Sample Manifest Snippet for Gramine GPU Support (TOML)
+
+# Enable Gramine's GPU support features.
+# If false or not present, the GPU API calls from within the enclave might fail
+# or not be initialized.
+sgx.gramine_gpu_enable = true
+
+# Specifies the path to the CUDA proxy executable that the LibOS will launch.
+# This path should be accessible from Gramine's perspective.
+# It's recommended to use a path within the Gramine installation or application package.
+sgx.gpu_proxy_executable = "file:/opt/gramine/bin/gramine-cuda-proxy"
+
+# List of trusted files. The CUDA proxy executable must be included here
+# to allow Gramine to measure and attest it before execution.
+# This ensures the integrity of the proxy.
+sgx.trusted_files = [
+  "file:/opt/gramine/bin/gramine-cuda-proxy",
+  # Add other trusted files as needed by the application.
+]
+
+# Filesystem mounts for the enclave.
+# This section defines how different parts of the filesystem are made available
+# to the sandboxed application.
+[[fs.mounts]]
+  # Mount for Shared Memory (SHM) used for GPU IPC.
+  # This region is used for efficient data transfer between the enclave and the CUDA proxy
+  # for operations like memcpy and potentially for kernel arguments or PTX/CUBIN data.
+  type = "untrusted_shm"
+  # Path to the shared memory region as seen from *inside* the Gramine enclave.
+  # The LibOS GPU component will use this path to access the shared memory.
+  path = "/dev/gramine_gpu_shm"
+  # URI specifying the backing mechanism on the host system.
+  # For `untrusted_shm`, this is typically a file path on the host that will be
+  # memory-mapped by both the proxy (host side) and Gramine (enclave side).
+  # The proxy application must be configured to use this same host path.
+  uri = "file:/tmp/gramine_gpu_shm_file"
+  # Size of the shared memory region. This should be large enough to accommodate
+  # the largest expected data transfers (e.g., CUDA memcpy operations, kernel arguments).
+  # Insufficient size can lead to errors or performance issues.
+  size = "128M" # Example: 128 Megabytes
+
+# --- Host-Side Proxy Dependencies (Informational Comments) ---
+# The following are NOT Gramine manifest options but are crucial for the proxy to function correctly on the host:
+#
+# 1. CUDA Driver and Libraries:
+#    - The host system must have a compatible NVIDIA CUDA driver installed.
+#    - The `gramine-cuda-proxy` executable will link against `libcuda.so.1` (CUDA driver API).
+#      This library must be accessible in the proxy's `LD_LIBRARY_PATH`.
+#
+# 2. mbedTLS Libraries (if used for encryption/decryption by the proxy):
+#    - If the proxy implements encryption for IPC data (recommended), it will need mbedTLS libraries
+#      (e.g., `libmbedtls.so`, `libmbedx509.so`, `libmbedcrypto.so`).
+#      These must be accessible in the proxy's `LD_LIBRARY_PATH`.
+#
+# 3. NVIDIA Device Nodes:
+#    - The proxy requires access to NVIDIA device nodes (e.g., `/dev/nvidia0`, `/dev/nvidiactl`, `/dev/nvidia-uvm`).
+#      Ensure appropriate permissions are set on the host for the user running the proxy.
+#
+# 4. Pipe and SHM File Paths:
+#    - The proxy needs to create/use named pipes (FIFOs) and the shared memory file specified in `uri` above.
+#      Ensure the directory for these files (e.g., `/tmp/`) is writable by the proxy.
+#
+# These host-side dependencies should be managed by the system administrator or the deployment
+# environment where the Gramine application and its proxy will run.
+# The `sgx.gpu_proxy_executable` is launched by Gramine, but its own runtime dependencies
+# are resolved on the host system.

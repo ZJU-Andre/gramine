@@ -114,6 +114,11 @@ libos_sources = files(
 # Arch-specific meson.build must define the following Meson variables:
 #   - `libos_sources_arch` - a list of arch-specific sources,
 #   - `libos_lds` - a full path to LibOS linker script.
+subdir('gpu') # Added for GPU support
+
+# Arch-specific meson.build must define the following Meson variables:
+#   - `libos_sources_arch` - a list of arch-specific sources,
+#   - `libos_lds` - a full path to LibOS linker script.
 subdir('arch')
 libos_sources += libos_sources_arch
 

@@ -1,0 +1,19 @@
+# Makefile saved as CI-Examples/gemm_Makefile
+# Assumes being run from the CI-Examples directory or that paths are adjusted.
+# To run: make -f gemm_Makefile
+
+CC = gcc
+# Adjust include path: if Makefile is in CI-Examples, libos_gpu.h is at ../libos/include
+# This path assumes the 'CI-Examples' directory is at the root of the repository,
+# and 'libos' is also at the root.
+CFLAGS = -g -Wall -I../libos/include
+TARGET = gemm_example # Output executable in the current directory (CI-Examples/)
+SOURCE = gemm_example.c
+
+all: $(TARGET)
+
+$(TARGET): $(SOURCE)
+	$(CC) $(CFLAGS) -o $(TARGET) $(SOURCE)
+
+clean:
+	rm -f $(TARGET)
